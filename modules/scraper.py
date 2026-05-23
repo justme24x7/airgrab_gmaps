@@ -10,7 +10,7 @@ import re
 import threading
 import time
 import traceback
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 from seleniumbase import Driver
 from selenium.common.exceptions import (
@@ -216,6 +216,76 @@ def _text_contains_any(text: str, words: set) -> bool:
         return False
     low = text.lower()
     return any(w in low for w in words)
+
+
+# Place-header summary (e.g. "2.7 (35)") — not individual review cards.
+_SUMMARY_RATING_REVIEWS_RE = re.compile(
+    r"(\d+[.,]\d+)\s*\(\s*([\d][\d,.\s]*)\s*\)"
+)
+_RATING_ARIA_RE = re.compile(
+    r"(?:rated\s+)?(\d+[.,]\d+|\d+)\s*(?:out of|/)\s*5|"
+    r"(\d+[.,]\d+|\d+)\s*(?:stars?|sterne|étoiles|estrellas|stelle|"
+    r"звезд|星|つ星|별)",
+    re.IGNORECASE,
+)
+_REVIEW_COUNT_ARIA_RE = re.compile(
+    r"([\d][\d,.\s]*)\s*(?:"
+    r"reviews?|ratings?|bewertungen?|avis|opinions?|valoraciones?|"
+    r"reseñas?|recensioni?|avaliações?|отзыв|レビュー|리뷰|评论|評論|"
+    r"ביקורות|รีวิว|yorumlar?|değerlendirme|beoordelingen?|recenz)",
+    re.IGNORECASE,
+)
+
+
+def _parse_decimal(value: str) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return float(value.strip().replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _parse_int_count(value: str) -> Optional[int]:
+    if not value:
+        return None
+    digits = re.sub(r"[^\d]", "", value)
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _parse_rating_from_aria(label: str) -> Optional[float]:
+    if not label:
+        return None
+    for match in _RATING_ARIA_RE.finditer(label):
+        raw = match.group(1) or match.group(2)
+        if raw:
+            parsed = _parse_decimal(raw)
+            if parsed is not None and 0 <= parsed <= 5:
+                return parsed
+    return None
+
+
+def _parse_review_count_from_aria(label: str) -> Optional[int]:
+    if not label:
+        return None
+    match = _REVIEW_COUNT_ARIA_RE.search(label)
+    if match:
+        return _parse_int_count(match.group(1))
+    return None
+
+
+def _parse_summary_rating_reviews_text(text: str) -> Tuple[Optional[float], Optional[int]]:
+    if not text:
+        return None, None
+    match = _SUMMARY_RATING_REVIEWS_RE.search(text.replace("\n", " "))
+    if not match:
+        return None, None
+    return _parse_decimal(match.group(1)), _parse_int_count(match.group(2))
 
 
 class _DriverSessionLost(Exception):
@@ -436,6 +506,137 @@ class GoogleReviewsScraper:
         if match:
             return match.group(1), match.group(2)
         return None, None
+
+    def _get_rating_and_total_reviews(self, driver: Chrome) -> Dict[str, Any]:
+        """
+        Read the place-level rating and total review count from the Maps header DOM
+        (e.g. ``2.7 (35)``). Does not iterate individual review cards.
+        """
+        rating: Optional[float] = None
+        total_reviews: Optional[int] = None
+
+        def _inside_review_card(element: WebElement) -> bool:
+            try:
+                return bool(driver.execute_script(
+                    "return arguments[0].closest('[data-review-id]') !== null;",
+                    element,
+                ))
+            except Exception:  # noqa: BLE001
+                return False
+
+        # Strategy 1: compact summary text in the place header row (F7nice, etc.).
+        header_selectors = (
+            'motion.div[role="main"] div.F7nice',
+            'div[role="main"] div.F7nice',
+            'motion.div[role="main"] div.fontBodyMedium',
+            'div[role="main"] h1 ~ div',
+        )
+        for selector in header_selectors:
+            try:
+                for block in driver.find_elements(By.CSS_SELECTOR, selector):
+                    if _inside_review_card(block):
+                        continue
+                    block_rating, block_count = _parse_summary_rating_reviews_text(
+                        block.text or ""
+                    )
+                    if block_rating is not None:
+                        rating = block_rating
+                    if block_count is not None:
+                        total_reviews = block_count
+                    if rating is not None and total_reviews is not None:
+                        break
+                if rating is not None and total_reviews is not None:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        # Strategy 2: aria-label on star image / review-count control.
+        aria_selectors = (
+            'motion.div[role="main"] [role="img"][aria-label]',
+            'div[role="main"] [role="img"][aria-label]',
+            'motion.div[role="main"] button[aria-label]',
+            'div[role="main"] button[aria-label]',
+            'motion.div[role="main"] a[aria-label]',
+            'motion.div[role="main"] span[aria-label]',
+        )
+        for selector in aria_selectors:
+            try:
+                for el in driver.find_elements(By.CSS_SELECTOR, selector):
+                    if _inside_review_card(el):
+                        continue
+                    label = el.get_attribute("aria-label") or ""
+                    if rating is None:
+                        parsed_rating = _parse_rating_from_aria(label)
+                        if parsed_rating is not None:
+                            rating = parsed_rating
+                    if total_reviews is None:
+                        parsed_count = _parse_review_count_from_aria(label)
+                        if parsed_count is not None:
+                            total_reviews = parsed_count
+                    if rating is not None and total_reviews is not None:
+                        break
+                if rating is not None and total_reviews is not None:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        # Strategy 3: visible numeric rating span near the header stars.
+        if rating is None:
+            rating_selectors = (
+                'motion.div[role="main"] div.F7nice span[aria-hidden="true"]',
+                'div[role="main"] div.F7nice span[aria-hidden="true"]',
+                'motion.div[role="main"] span.ceNzKf',
+            )
+            for selector in rating_selectors:
+                try:
+                    for span in driver.find_elements(By.CSS_SELECTOR, selector):
+                        if _inside_review_card(span):
+                            continue
+                        parsed = _parse_decimal(span.text or "")
+                        if parsed is not None and 0 <= parsed <= 5:
+                            rating = parsed
+                            break
+                    if rating is not None:
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        # Strategy 4: parenthetical count link/button text, e.g. "(35)".
+        if total_reviews is None:
+            count_selectors = (
+                'motion.div[role="main"] div.F7nice a',
+                'motion.div[role="main"] div.F7nice button',
+                'motion.div[role="main"] div.F7nice span',
+                'motion.div[role="main"] button[jsaction*="review"]',
+            )
+            for selector in count_selectors:
+                try:
+                    for el in driver.find_elements(By.CSS_SELECTOR, selector):
+                        if _inside_review_card(el):
+                            continue
+                        text = (el.text or "").strip()
+                        match = re.search(r"\(\s*([\d][\d,.\s]*)\s*\)", text)
+                        if match:
+                            parsed = _parse_int_count(match.group(1))
+                            if parsed is not None:
+                                total_reviews = parsed
+                                break
+                    if total_reviews is not None:
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        result = {"rating": rating, "total_reviews": total_reviews}
+        print(
+            f"summary_rating_reviews: rating={rating}, total_reviews={total_reviews}"
+        )
+        log.info(
+            "Place summary from DOM — rating=%s, total_reviews=%s",
+            rating, total_reviews,
+        )
+        self.place_rating = rating
+        self.total_reviews = total_reviews
+        return result
 
     def navigate_to_place(self, driver: Chrome, url: str, wait: WebDriverWait) -> bool:
         """
@@ -1492,7 +1693,8 @@ class GoogleReviewsScraper:
                 seen = self.review_db.get_review_ids(place_id)
 
             self.dismiss_cookies(driver)
-            self.click_reviews_tab(driver)
+            self._get_rating_and_total_reviews(driver)
+            # self.click_reviews_tab(driver)
 
             # Extra wait after clicking reviews tab to ensure page loads
             log.info("Waiting for reviews page to fully load...")
