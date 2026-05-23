@@ -510,7 +510,7 @@ class GoogleReviewsScraper:
     def _get_rating_and_total_reviews(self, driver: Chrome) -> Dict[str, Any]:
         """
         Read the place-level rating and total review count from the Maps header DOM
-        (e.g. ``2.7 (35)``). Does not iterate individual review cards.
+        (e.g. ``2.7 (35)``). Does not iterate individual review cards .
         """
         rating: Optional[float] = None
         total_reviews: Optional[int] = None
