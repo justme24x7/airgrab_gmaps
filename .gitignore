@@ -61,8 +61,11 @@ docs/plans/
 config.yaml
 *.ini
 .env
+.env.*
+!.env.example
 .envrc
 secrets.json
+airgrab/.env
 
 # -----------------------------------------------------------
 # Downloaded Images
