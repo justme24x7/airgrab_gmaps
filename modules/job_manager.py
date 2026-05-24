@@ -179,8 +179,8 @@ class JobManager:
                     job.error_message = "Scraper returned failure (no reviews found or navigation error)"
                     job.progress = {"stage": "failed", "message": "Scraping failed"}
 
-                job.reviews_count = getattr(scraper, 'total_reviews', None)
-                job.images_count = getattr(scraper, 'total_images', None)
+                job.reviews_count = getattr(scraper, "total_reviews", None)
+                job.images_count = None
                 job._scraper = None
 
             log.info(f"Completed scraping job {job_id}")

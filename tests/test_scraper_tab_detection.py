@@ -25,6 +25,6 @@ class TestSummaryParsing:
 
 class TestScraperInit:
     def test_minimal_config(self):
-        scraper = GoogleReviewsScraper({"url": "https://maps.google.com/", "db_path": ":memory:"})
+        scraper = GoogleReviewsScraper({"url": "https://maps.google.com/"})
         assert scraper.place_rating is None
         assert scraper.total_reviews is None

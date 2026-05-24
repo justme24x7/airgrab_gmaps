@@ -108,27 +108,22 @@ def _build_business_config(base_config, overrides):
 
 
 def _run_scrape(config, args):
-    """Run the scrape command."""
-    from modules.scraper import GoogleReviewsScraper
+    """Run the airgrab batch scraper (p3) over GAPI output files."""
+    from modules.scraper import main as scraper_main
 
     _apply_scrape_overrides(config, args)
+    # --headless is store_true: False means "flag not passed", not "disable headless"
+    headless = bool(config.get("headless", True))
+    if getattr(args, "headless", False):
+        headless = True
+    elif getattr(args, "no_headless", False):
+        headless = False
 
-    businesses = _resolve_businesses(config)
-    if not businesses:
-        print("Error: No URL configured. Use --url or set 'businesses'/'urls' in config.yaml")
-        sys.exit(1)
+    argv = ["--headless"] if headless else ["--no-headless"]
+    if getattr(args, "limit_batches", None):
+        argv.extend(["--limit-batches", str(args.limit_batches)])
 
-    for i, biz in enumerate(businesses):
-        biz_config = _build_business_config(config, biz)
-        url = biz_config.get("url", "")
-        if len(businesses) > 1:
-            print(f"\n--- Scraping business {i + 1}/{len(businesses)}: {url} ---")
-
-        scraper = GoogleReviewsScraper(biz_config)
-        try:
-            scraper.scrape()
-        finally:
-            scraper.review_db.close()
+    raise SystemExit(scraper_main(argv))
 
 
 def _run_export(config, args):
@@ -494,13 +489,7 @@ def _run_health(config, args):
 
     from modules.scraper import GoogleReviewsScraper
 
-    probe_config = dict(config)
-    probe_config["url"] = synthetic_url
-    probe_config["max_reviews"] = 1
-    probe_config["scrape_mode"] = "new_only"
-    probe_config["download_images"] = False
-    probe_config["use_mongodb"] = False
-    probe_config["backup_to_json"] = False
+    probe_config = {"url": synthetic_url, "headless": config.get("headless", True)}
 
     scraper = GoogleReviewsScraper(probe_config)
     ok = False
