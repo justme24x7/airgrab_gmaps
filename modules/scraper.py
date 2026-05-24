@@ -45,6 +45,8 @@ DEFAULT_OUTPUT_DIR = AIRGRAB_DIR / "batched_scraper_details_p3" / "output"
 DEFAULT_ERROR_DIR = AIRGRAB_DIR / "batched_scraper_details_p3" / "output_errors"
 MANIFEST_PATH = AIRGRAB_DIR / "batched_scraper_details_p3" / "scraper_run_mainfest.json"
 BATCH_GLOB = "batch_*.json"
+SUMMARY_WAIT_TIMEOUT = 10
+COOKIE_DISMISS_TIMEOUT = 2
 
 COOKIE_BTN = (
     'button[aria-label*="Accept" i],'
@@ -177,6 +179,7 @@ class GoogleReviewsScraper:
         self.total_reviews: Optional[int] = None
         self._driver: Chrome | None = None
         self._wait: WebDriverWait | None = None
+        self._maps_session_ready = False
 
     def setup_driver(self, headless: bool | None = None) -> Chrome:
         """Set up SeleniumBase UC Mode Chrome driver."""
@@ -206,7 +209,7 @@ class GoogleReviewsScraper:
                 incognito=True,
             )
 
-        driver.set_page_load_timeout(30)
+        driver.set_page_load_timeout(20)
         driver.set_window_size(1400, 900)
 
         try:
@@ -240,15 +243,33 @@ class GoogleReviewsScraper:
             pass
         self._driver = None
         self._wait = None
+        self._maps_session_ready = False
 
     def restart_driver(self) -> None:
         self.stop_driver()
+        self._maps_session_ready = False
         self.start_driver()
+
+    def _wait_for_place_summary(
+        self,
+        driver: Chrome,
+        timeout: float = SUMMARY_WAIT_TIMEOUT,
+    ) -> bool:
+        """Wait until rating/review summary header is present."""
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, 'div[role="main"] div.F7nice, div.F7nice')
+                )
+            )
+            return True
+        except TimeoutException:
+            return False
 
     def dismiss_cookies(self, driver: Chrome) -> bool:
         """Dismiss cookie consent dialogs if present."""
         try:
-            WebDriverWait(driver, 3).until(
+            WebDriverWait(driver, COOKIE_DISMISS_TIMEOUT).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, COOKIE_BTN))
             )
             for elem in driver.find_elements(By.CSS_SELECTOR, COOKIE_BTN):
@@ -265,27 +286,16 @@ class GoogleReviewsScraper:
             log.debug("Error handling cookie dialog: %s", exc)
         return False
 
-    def _extract_place_name(self, driver: Chrome, url: str) -> str:
+    def _place_name_from_url(self, url: str) -> str:
+        """Parse place name from a /maps/place/ URL without loading the page."""
         import urllib.parse
 
         match = re.search(r"/maps/place/([^/@]+)", url)
-        if match:
-            name = urllib.parse.unquote(match.group(1))
-            name = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", name)
-            if len(name) > 2:
-                return name
-
-        try:
-            driver.get(url)
-            time.sleep(4)
-            title = driver.title or ""
-            name = title.replace(" - Google Maps", "").strip()
-            name = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", name)
-            if name:
-                return name
-        except Exception as exc:  # noqa: BLE001
-            log.debug("Could not extract place name from page: %s", exc)
-        return ""
+        if not match:
+            return ""
+        name = urllib.parse.unquote(match.group(1))
+        name = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", name)
+        return name if len(name) > 2 else ""
 
     def _extract_place_coords(self, url: str) -> tuple:
         match = re.search(r"@(-?[\d.]+),(-?[\d.]+)", url)
@@ -453,53 +463,62 @@ class GoogleReviewsScraper:
             pass
         return False
 
-    def navigate_to_place(self, driver: Chrome, url: str, wait: WebDriverWait) -> bool:
+    def navigate_to_place(
+        self,
+        driver: Chrome,
+        url: str,
+        wait: WebDriverWait,
+        *,
+        place_name: str | None = None,
+    ) -> bool:
+        """Navigate to a place page; prefer one load + wait over fixed sleeps."""
+        import urllib.parse
+
         log.info("Navigating to place: %s", url)
 
-        try:
-            driver.get("https://www.google.com")
-            time.sleep(2)
+        if not self._maps_session_ready:
+            try:
+                driver.get("https://www.google.com/maps")
+                self.dismiss_cookies(driver)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Maps session warm-up failed: %s", exc)
+            self._maps_session_ready = True
+
+        driver.get(url)
+        if self._wait_for_place_summary(driver):
             self.dismiss_cookies(driver)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("Warm-up navigation failed: %s", exc)
+            if self._is_limited_view(driver):
+                log.warning("Google Maps limited view detected")
+            return True
 
-        place_name = self._extract_place_name(driver, url)
-        current_url = driver.current_url
-
-        if place_name:
-            lat, lng = self._extract_place_coords(current_url)
+        search_name = (place_name or "").strip() or self._place_name_from_url(url)
+        if search_name:
+            query = urllib.parse.quote(search_name)
+            lat, lng = self._extract_place_coords(url)
             if lat and lng:
                 search_url = (
-                    f"https://www.google.com/maps/search/{place_name}/@{lat},{lng},17z"
+                    f"https://www.google.com/maps/search/{query}/@{lat},{lng},17z"
                 )
             else:
-                search_url = f"https://www.google.com/maps/search/{place_name}/"
+                search_url = f"https://www.google.com/maps/search/{query}"
 
-            log.info("Trying search-based navigation: %s", search_url)
+            log.info("Direct URL slow; trying search navigation: %s", search_url)
             driver.get(search_url)
-            time.sleep(5)
-
-            if self._place_page_loaded(driver):
-                log.info("Search-based navigation successful")
+            if self._wait_for_place_summary(driver):
                 self.dismiss_cookies(driver)
                 return True
 
-            log.info("Search navigation missed header; trying direct URL")
-
-        driver.get(url)
-        try:
-            wait.until(lambda d: "google.com/maps" in d.current_url)
-        except TimeoutException:
-            log.warning("Timed out waiting for Google Maps to load")
-        time.sleep(3)
         self.dismiss_cookies(driver)
-
         if self._is_limited_view(driver):
             log.warning("Google Maps limited view detected")
+        return self._place_page_loaded(driver)
 
-        return True
-
-    def scrape_place_summary(self, url: str) -> Dict[str, Any]:
+    def scrape_place_summary(
+        self,
+        url: str,
+        *,
+        place_name: str | None = None,
+    ) -> Dict[str, Any]:
         """Navigate to a Maps URL and return rating + total_reviews."""
         if self._driver is None or self._wait is None:
             raise ScraperError("WebDriver not started; call start_driver() first")
@@ -515,14 +534,9 @@ class GoogleReviewsScraper:
         except (InvalidSessionIdException, NoSuchWindowException, WebDriverException) as exc:
             raise _DriverSessionLost(str(exc)) from exc
 
-        self.navigate_to_place(driver, url, wait)
-        self.dismiss_cookies(driver)
-
-        try:
-            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(2)
+        self.navigate_to_place(driver, url, wait, place_name=place_name)
+        if not self._wait_for_place_summary(driver, timeout=3):
+            time.sleep(0.5)
 
         try:
             current_url = (driver.current_url or "").lower()
@@ -590,8 +604,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--delay",
         type=float,
-        default=1.0,
-        help="Seconds between restaurant scrapes (default: 1.0)",
+        default=0.2,
+        help="Seconds between restaurant scrapes (default: 0.2)",
     )
     parser.add_argument(
         "--limit-batches",
@@ -705,8 +719,10 @@ def process_provider(
         }
         return None, record
 
+    place_name = str(provider.get("name") or "").strip() or None
+
     try:
-        summary = scraper.scrape_place_summary(maps_url)
+        summary = scraper.scrape_place_summary(maps_url, place_name=place_name)
         merge_summary_into_results(record, summary)
         return record, None
     except (_DriverSessionLost, _RateLimited):
