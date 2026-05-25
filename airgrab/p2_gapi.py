@@ -12,9 +12,13 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
-from call_gapi import DEFAULT_FIELD_MASK, GapiError, search_text
+from call_gapi import (
+    DEFAULT_FIELD_MASK,
+    GapiError,
+    build_results_from_gapi_response,
+    search_text,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BATCH_DIR = SCRIPT_DIR / "batched_raw_providers_p1"
@@ -22,7 +26,6 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2/output"
 DEFAULT_ERROR_DIR = SCRIPT_DIR / "batched_gapi_details_p2/output_errors"
 MANIFEST_PATH = SCRIPT_DIR / "batched_gapi_details_p2/gapi_run_mainfest.json"
 BATCH_GLOB = "batch_*.json"
-CID_URI_TEMPLATE = "https://maps.google.com/?cid={cid}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,6 +155,11 @@ def batch_id_from_path(batch_path: Path) -> str:
     return batch_path.stem
 
 
+def batch_number_from_path(batch_path: Path) -> int:
+    match = re.search(r"(\d+)$", batch_path.stem)
+    return int(match.group(1)) if match else 0
+
+
 def relative_to_script(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(SCRIPT_DIR))
@@ -187,52 +195,6 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
     write_json(path, manifest)
 
 
-def extract_cid_from_google_maps_uri(google_maps_uri: str) -> str | None:
-    """Parse cid query param from a Google Maps URI."""
-    uri = google_maps_uri.strip()
-    if not uri:
-        return None
-
-    query = parse_qs(urlparse(uri).query)
-    cid_values = query.get("cid")
-    if cid_values and cid_values[0]:
-        return cid_values[0]
-
-    match = re.search(r"[?&]cid=([^&]+)", uri)
-    return match.group(1) if match else None
-
-
-def build_place_result(place: dict[str, Any]) -> dict[str, str] | None:
-    """Build {cid, formatted_google_maps_uri} from a single Places API place object."""
-    google_maps_uri = str(place.get("googleMapsUri") or "")
-    cid = extract_cid_from_google_maps_uri(google_maps_uri)
-    if not cid:
-        return None
-    return {
-        "cid": cid,
-        "formatted_google_maps_uri": CID_URI_TEMPLATE.format(cid=cid),
-    }
-
-
-def build_results_from_gapi_response(
-    gapi_response: dict[str, Any],
-) -> dict[str, str] | None:
-    """
-    Build results from places[0] only (top Text Search match).
-
-    Returns None when places[0] is missing or has no parseable googleMapsUri/cid.
-    """
-    places = gapi_response.get("places")
-    if not isinstance(places, list) or not places:
-        return None
-
-    first_place = places[0]
-    if not isinstance(first_place, dict):
-        return None
-
-    return build_place_result(first_place)
-
-
 def process_provider(
     provider: dict,
     *,
@@ -266,6 +228,7 @@ def process_batch_file(
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
     batch_id = batch_id_from_path(batch_path)
+    batch_number = batch_number_from_path(batch_path)
     input_file = relative_to_script(batch_path)
 
     providers = load_batch(batch_path)
@@ -286,6 +249,11 @@ def process_batch_file(
             )
             continue
 
+        provider_name = provider.get("name", "<unnamed>")
+        print(
+            f"  Processing batch {batch_number} provider: {provider_name} "
+            f"at index: {index}"
+        )
         success, error = process_provider(provider, field_mask=field_mask)
         if success is not None:
             successes.append(success)

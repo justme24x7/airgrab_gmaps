@@ -648,6 +648,11 @@ def batch_id_from_path(batch_path: Path) -> str:
     return batch_path.stem
 
 
+def batch_number_from_path(batch_path: Path) -> int:
+    match = re.search(r"(\d+)$", batch_path.stem)
+    return int(match.group(1)) if match else 0
+
+
 def relative_to_airgrab(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(AIRGRAB_DIR))
@@ -699,6 +704,15 @@ def maps_url_from_record(record: dict) -> str | None:
     return str(uri).strip() if uri else None
 
 
+def has_scrapable_maps_result(record: dict) -> bool:
+    results = record.get("results")
+    if not isinstance(results, dict):
+        return False
+    cid = str(results.get("cid") or "").strip()
+    maps_uri = maps_url_from_record(record)
+    return bool(cid and maps_uri)
+
+
 def merge_summary_into_results(record: dict, summary: dict[str, Any]) -> None:
     if not isinstance(record.get("results"), dict):
         record["results"] = {}
@@ -713,11 +727,7 @@ def process_provider(
     record = deepcopy(provider)
     maps_url = maps_url_from_record(record)
     if not maps_url:
-        record["scraper_error"] = {
-            "message": "Missing results.formatted_googleMapsUri (run p2_gapi first)",
-            "details": record.get("results"),
-        }
-        return None, record
+        return record, None
 
     place_name = str(provider.get("name") or "").strip() or None
 
@@ -752,11 +762,13 @@ def process_batch_file(
     batch_started = utc_now_iso()
     batch_start_perf = time.perf_counter()
     batch_id = batch_id_from_path(batch_path)
+    batch_number = batch_number_from_path(batch_path)
     input_file = relative_to_airgrab(batch_path)
 
     providers = load_batch(batch_path)
     successes: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    missing_results_formatted_googleMapsUri_count = 0
 
     for index, provider in enumerate(providers):
         if not isinstance(provider, dict):
@@ -769,6 +781,16 @@ def process_batch_file(
                     },
                 }
             )
+            continue
+
+        provider_name = provider.get("name", "<unnamed>")
+        print(
+            f"  Processing batch {batch_number} provider: {provider_name} "
+            f"at index: {index}"
+        )
+        if not has_scrapable_maps_result(provider):
+            successes.append(deepcopy(provider))
+            missing_results_formatted_googleMapsUri_count += 1
             continue
 
         try:
@@ -821,6 +843,9 @@ def process_batch_file(
         "restaurant_count": len(providers),
         "success_count": success_count,
         "error_count": error_count,
+        "missing_results_formatted_googleMapsUri_count": (
+            missing_results_formatted_googleMapsUri_count
+        ),
     }
 
 
@@ -910,6 +935,10 @@ def run_batches(
 
     successful_batches = sum(1 for b in batch_results if b["status"] == "success")
     error_batches = len(batch_results) - successful_batches
+    missing_results_formatted_googleMapsUri_count = sum(
+        b.get("missing_results_formatted_googleMapsUri_count", 0)
+        for b in batch_results
+    )
 
     run_record = {
         "run_id": run_started,
@@ -919,6 +948,9 @@ def run_batches(
         "total_batches_count": len(batch_results),
         "successful_batches_count": successful_batches,
         "error_batches_count": error_batches,
+        "missing_results_formatted_googleMapsUri_count": (
+            missing_results_formatted_googleMapsUri_count
+        ),
         "batches": batch_results,
     }
 

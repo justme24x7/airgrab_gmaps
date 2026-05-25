@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -25,6 +27,9 @@ DEFAULT_FIELD_MASK = (
     "places.subDestinations,places.timeZone,places.types,places.utcOffsetMinutes,"
     "places.viewport"
 )
+CID_URI_TEMPLATE = "https://maps.google.com/?cid={cid}"
+# If len(places) is greater than this, cid / Maps URI are left empty (ambiguous match).
+MAX_PLACES_FOR_UNIQUE_MATCH = 2
 
 
 def normalize_field_mask(field_mask: str | tuple[str, ...] | list[str]) -> str:
@@ -142,3 +147,59 @@ def search_text(
         status_code=response.status_code,
         response_body=body,
     )
+
+
+def extract_cid_from_google_maps_uri(google_maps_uri: str) -> str | None:
+    """Parse cid query param from a Google Maps URI."""
+    uri = google_maps_uri.strip()
+    if not uri:
+        return None
+
+    query = parse_qs(urlparse(uri).query)
+    cid_values = query.get("cid")
+    if cid_values and cid_values[0]:
+        return cid_values[0]
+
+    match = re.search(r"[?&]cid=([^&]+)", uri)
+    return match.group(1) if match else None
+
+
+def empty_place_result() -> dict[str, str]:
+    return {"cid": "", "formatted_google_maps_uri": ""}
+
+
+def build_place_result(place: dict[str, Any]) -> dict[str, str] | None:
+    """Build {cid, formatted_google_maps_uri} from a single Places API place object."""
+    google_maps_uri = str(place.get("googleMapsUri") or "")
+    cid = extract_cid_from_google_maps_uri(google_maps_uri)
+    if not cid:
+        return None
+    return {
+        "cid": cid,
+        "formatted_google_maps_uri": CID_URI_TEMPLATE.format(cid=cid),
+    }
+
+
+def build_results_from_gapi_response(
+    gapi_response: dict[str, Any],
+    *,
+    max_places_for_match: int = MAX_PLACES_FOR_UNIQUE_MATCH,
+) -> dict[str, str] | None:
+    """
+    Build results from places[0] when the match is unambiguous.
+
+    If len(places) > max_places_for_match (default > 2), returns empty cid and URI.
+    Otherwise uses places[0] only.
+    """
+    places = gapi_response.get("places")
+    if not isinstance(places, list) or not places:
+        return None
+
+    if len(places) > max_places_for_match:
+        return empty_place_result()
+
+    first_place = places[0]
+    if not isinstance(first_place, dict):
+        return None
+
+    return build_place_result(first_place)
