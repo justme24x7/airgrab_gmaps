@@ -15,7 +15,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2" / "output"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2" / "output"
 DEFAULT_MIN_PLACES_LENGTH = 1  # len(places) > 0
-DEFAULT_MAX_PLACES_LENGTH = 100
+DEFAULT_MAX_PLACES_LENGTH = 5
+DEFAULT_MIN_DISTANCE = 0.0
+DEFAULT_MAX_DISTANCE = 200.0
 # DEFAULT_MIN_PLACES_LENGTH = 2  # len(places) > 1
 # DEFAULT_MIN_PLACES_LENGTH = 3  # len(places) > 2
 BATCH_GLOB = "batch_*.json"
@@ -150,6 +152,19 @@ def distance_summary(values: list[float]) -> str:
     )
 
 
+def first_place_distance_meters(provider: dict[str, Any]) -> float | None:
+    gapi_response = provider.get("gapi_response")
+    if not isinstance(gapi_response, dict):
+        return None
+    places = gapi_response.get("places")
+    if not isinstance(places, list) or not places or not isinstance(places[0], dict):
+        return None
+
+    source_lat, source_lng = address_gps(provider)
+    place_lat, place_lng = place_location(places[0])
+    return crow_fly_distance_meters(source_lat, source_lng, place_lat, place_lng)
+
+
 def iter_matching_providers(
     output_dir: Path,
     min_places_length: int,
@@ -199,23 +214,35 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
+    filtered_matches: list[tuple[Path, dict[str, Any], int]] = []
+    for batch_path, provider, count in matches:
+        distance_meters = first_place_distance_meters(provider)
+        if distance_meters is None:
+            continue
+        if DEFAULT_MIN_DISTANCE <= distance_meters <= DEFAULT_MAX_DISTANCE:
+            filtered_matches.append((batch_path, provider, count))
+
     print(
         f"Scanning {output_dir.relative_to(SCRIPT_DIR)} "
         f"(places[] length between {args.min_places_length} and "
-        f"{args.max_places_length})\n"
+        f"{args.max_places_length}, places[0] distance between "
+        f"{DEFAULT_MIN_DISTANCE:.1f} m and {DEFAULT_MAX_DISTANCE:.1f} m)\n"
     )
 
     first_place_distances_meters: list[float] = []
     all_places_distances_meters: list[float] = []
 
-    for batch_path, provider, count in matches:
+    for batch_path, provider, count in filtered_matches:
         provider_id = provider.get("id", "<unknown>")
         name = provider.get("name", "<unnamed>")
+        text_query = str(provider.get("text_query") or "").strip()
         gapi_response = provider.get("gapi_response")
         places = gapi_response.get("places") if isinstance(gapi_response, dict) else []
         source_lat, source_lng = address_gps(provider)
 
         print(f"[{batch_path.name}] {provider_id} | {name} | places: {count}")
+        if text_query:
+            print(f"  text_query: {text_query}")
         print(f"  address.gps: lat={source_lat}, long={source_lng}")
 
         if isinstance(places, list):
@@ -234,20 +261,27 @@ def main() -> int:
                     place_name = display_name.get("text", "<unnamed place>")
                 else:
                     place_name = "<unnamed place>"
+                formatted_address = str(place.get("formattedAddress") or "").strip()
                 distance_text = (
                     f"{distance_meters:.1f} m"
                     if distance_meters is not None
                     else "n/a"
                 )
+                google_maps_uri = str(place.get("googleMapsUri") or "").strip()
                 if distance_meters is not None:
                     all_places_distances_meters.append(distance_meters)
                     if place_index == 0:
                         first_place_distances_meters.append(distance_meters)
-                print(
+                line = (
                     f"    place[{place_index}] {place_name} | "
                     f"location: lat={place_lat}, long={place_lng} | "
                     f"distance: {distance_text}"
                 )
+                if formatted_address:
+                    line += f" | formattedAddress: {formatted_address}"
+                if google_maps_uri:
+                    line += f" | googleMapsUri: {google_maps_uri}"
+                print(line)
         print()
 
     print("Global distance summary")
@@ -280,7 +314,9 @@ def main() -> int:
         f"{sum(1 for d in first_place_distances_meters if d > 1000)}"
     )
     print()
-    print(f"\nTotal: {len(matches)} / {total_restaurants_scanned} restaurant(s)")
+    print(
+        f"\nTotal: {len(filtered_matches)} / {total_restaurants_scanned} restaurant(s)"
+    )
     return 0
 
 
