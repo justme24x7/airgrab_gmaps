@@ -11,7 +11,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "raw_input" / "raw_provider_details.json"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_raw_providers_p1"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p1_batched_raw_providers"
 DEFAULT_BATCH_SIZE = 100
 
 

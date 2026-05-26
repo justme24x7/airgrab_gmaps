@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run Google Places Text Search for batched provider files."""
+"""Call Google Places Text Search and store raw GAPI responses."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -12,27 +13,62 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from call_gapi import (
-    DEFAULT_FIELD_MASK,
-    GapiError,
-    build_results_from_gapi_response,
-    search_text,
-)
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BATCH_DIR = SCRIPT_DIR / "batched_raw_providers_p1"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2/output"
-DEFAULT_ERROR_DIR = SCRIPT_DIR / "batched_gapi_details_p2/output_errors"
-MANIFEST_PATH = SCRIPT_DIR / "batched_gapi_details_p2/gapi_run_mainfest.json"
+REPO_ROOT = SCRIPT_DIR.parent
+ENV_FILES = (REPO_ROOT / ".env", SCRIPT_DIR / ".env")
+PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+DEFAULT_FIELD_MASK = (
+    "places.id,places.accessibilityOptions,places.addressComponents,"
+    "places.addressDescriptor,places.adrFormatAddress,places.businessStatus,"
+    "places.containingPlaces,places.displayName,places.formattedAddress,"
+    "places.googleMapsLinks,places.googleMapsUri,places.iconBackgroundColor,"
+    "places.iconMaskBaseUri,places.location,places.openingDate,places.plusCode,"
+    "places.postalAddress,places.primaryType,places.primaryTypeDisplayName,"
+    "places.pureServiceAreaBusiness,places.shortFormattedAddress,"
+    "places.subDestinations,places.timeZone,places.types,places.utcOffsetMinutes,"
+    "places.viewport"
+)
+API_KEY_ENV = "GOOGLE_PLACES_API_KEY"
+
+DEFAULT_BATCH_DIR = SCRIPT_DIR / "p1_batched_raw_providers"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
+DEFAULT_ERROR_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output_errors"
+MANIFEST_PATH = SCRIPT_DIR / "p2_batched_gapi_details" / "gapi_run_mainfest.json"
+PROCESSED_DICT_PATH = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "gapi_processed_dict.json"
 BATCH_GLOB = "batch_*.json"
+LOCATION_BIAS_RADIUS = 200.0
 
 
-def parse_args() -> argparse.Namespace:
+class GapiError(Exception):
+    """Raised when the Places Text Search API returns an error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_body: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "message": str(self),
+            "status_code": self.status_code,
+            "response_body": self.response_body,
+        }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Call Google Places Text Search for each restaurant in batch files "
-            "and write enriched JSON to output/ and output_errors/."
+            "and write raw GAPI responses to output/ and output_errors/."
         )
     )
     parser.add_argument(
@@ -70,7 +106,46 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Process only the first N batch files (for testing)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def normalize_field_mask(field_mask: str | tuple[str, ...] | list[str]) -> str:
+    if isinstance(field_mask, (tuple, list)):
+        return ",".join(field_mask)
+    return str(field_mask).replace(" ", "")
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.is_file():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def load_dotenv() -> None:
+    for path in ENV_FILES:
+        _load_env_file(path)
+
+
+def get_api_key() -> str:
+    load_dotenv()
+    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    if not api_key:
+        raise GapiError(
+            f"{API_KEY_ENV} is not set. Add it to {REPO_ROOT / '.env'} "
+            f"(see {REPO_ROOT / '.env.example'})."
+        )
+    return api_key
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -83,8 +158,41 @@ def _contains(haystack: str, needle: str) -> bool:
     return needle.casefold() in haystack.casefold()
 
 
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
+
+
+def build_location_bias(provider: dict) -> dict[str, Any] | None:
+    address = provider.get("address")
+    if not isinstance(address, dict):
+        return None
+
+    gps = address.get("gps")
+    if not isinstance(gps, dict):
+        return None
+
+    latitude = _to_float(gps.get("lat"))
+    longitude = _to_float(gps.get("long"))
+    if latitude is None or longitude is None:
+        return None
+
+    return {
+        "circle": {
+            "center": {
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+            "radius": LOCATION_BIAS_RADIUS,
+        }
+    }
+
+
 def format_places_text_query(provider: dict) -> str:
-    """Build a textQuery string for Google Places Text Search (New)."""
     name = _normalize_whitespace(str(provider.get("name") or ""))
     address = provider.get("address")
     if not isinstance(address, dict):
@@ -119,6 +227,55 @@ def format_places_text_query(provider: dict) -> str:
     if name:
         return name
     return ", ".join(address_parts)
+
+
+def search_text(
+    text_query: str,
+    *,
+    api_key: str | None = None,
+    field_mask: str = DEFAULT_FIELD_MASK,
+    location_bias: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    query = text_query.strip()
+    if not query:
+        raise GapiError("textQuery must not be empty")
+
+    key = api_key or get_api_key()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": normalize_field_mask(field_mask),
+    }
+    payload_data: dict[str, Any] = {"textQuery": query}
+    if location_bias is not None:
+        payload_data["locationBias"] = location_bias
+    payload = json.dumps(payload_data).encode("utf-8")
+    request = urllib_request.Request(
+        PLACES_SEARCH_URL,
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            body_bytes = response.read()
+            body_text = body_bytes.decode("utf-8")
+            return json.loads(body_text)
+    except urllib_error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            body: Any = json.loads(body_text)
+        except json.JSONDecodeError:
+            body = body_text
+        raise GapiError(
+            f"Places API error ({exc.code})",
+            status_code=exc.code,
+            response_body=body,
+        ) from exc
+    except urllib_error.URLError as exc:
+        raise GapiError(f"HTTP request failed: {exc}") from exc
 
 
 def list_batch_files(batch_dir: Path) -> list[Path]:
@@ -174,18 +331,15 @@ def _empty_manifest() -> dict[str, Any]:
 def load_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return _empty_manifest()
-
     raw = path.read_text(encoding="utf-8").strip()
     if not raw:
         return _empty_manifest()
-
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return _empty_manifest()
-
     if not isinstance(data, dict):
-        raise ValueError(f"{path.name}: expected a JSON object")
+        return _empty_manifest()
     if not isinstance(data.get("runs"), list):
         data["runs"] = []
     return data
@@ -195,27 +349,56 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
     write_json(path, manifest)
 
 
+def load_processed_lookup(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return {
+        str(provider_id): entry
+        for provider_id, entry in data.items()
+        if isinstance(entry, dict)
+    }
+
+
 def process_provider(
     provider: dict,
     *,
     field_mask: str,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """
-    Returns (success_record, error_record).
-    Exactly one of the tuple elements will be non-None for a valid provider dict.
-    """
+    processed_lookup: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
     record = deepcopy(provider)
     text_query = format_places_text_query(provider)
     record["text_query"] = text_query
+    location_bias = build_location_bias(provider)
+    provider_id = str(provider.get("id") or "").strip()
+
+    if provider_id and provider_id in processed_lookup:
+        cached_entry = processed_lookup[provider_id]
+        record["gapi_response"] = deepcopy(cached_entry.get("gapi_response", {}))
+        return record, None, True
 
     try:
-        gapi_response = search_text(text_query, field_mask=field_mask)
-        record["gapi_response"] = gapi_response
-        record["results"] = build_results_from_gapi_response(gapi_response)
-        return record, None
+        record["gapi_response"] = search_text(
+            text_query,
+            field_mask=field_mask,
+            location_bias=location_bias,
+        )
+        return record, None, False
     except GapiError as exc:
         record["gapi_error"] = exc.to_dict()
-        return None, record
+        return None, record, False
 
 
 def process_batch_file(
@@ -225,6 +408,7 @@ def process_batch_file(
     error_dir: Path,
     field_mask: str,
     delay: float,
+    processed_lookup: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
     batch_id = batch_id_from_path(batch_path)
@@ -234,6 +418,8 @@ def process_batch_file(
     providers = load_batch(batch_path)
     successes: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    api_called_count = 0
+    api_skipped_count = 0
 
     for index, provider in enumerate(providers):
         if not isinstance(provider, dict):
@@ -254,7 +440,17 @@ def process_batch_file(
             f"  Processing batch {batch_number} provider: {provider_name} "
             f"at index: {index}"
         )
-        success, error = process_provider(provider, field_mask=field_mask)
+        success, error, was_skipped = process_provider(
+            provider,
+            field_mask=field_mask,
+            processed_lookup=processed_lookup,
+        )
+        if was_skipped:
+            api_skipped_count += 1
+            print("    google api: skipped (reused gapi_response from processed dict)")
+        else:
+            api_called_count += 1
+            print("    google api: called")
         if success is not None:
             successes.append(success)
         if error is not None:
@@ -296,11 +492,13 @@ def process_batch_file(
         "restaurant_count": len(providers),
         "success_count": success_count,
         "error_count": error_count,
+        "api_called_count": api_called_count,
+        "api_skipped_count": api_skipped_count,
     }
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     batch_dir = args.batch_dir.resolve()
     output_dir = args.output_dir.resolve()
     error_dir = args.error_dir.resolve()
@@ -316,6 +514,7 @@ def main() -> int:
 
     run_started = utc_now_iso()
     batch_results: list[dict[str, Any]] = []
+    processed_lookup = load_processed_lookup(PROCESSED_DICT_PATH)
 
     for batch_path in batch_files:
         print(f"Processing {batch_path.name} ...")
@@ -326,6 +525,7 @@ def main() -> int:
                 error_dir=error_dir,
                 field_mask=args.field_mask,
                 delay=args.delay,
+                processed_lookup=processed_lookup,
             )
         except (OSError, json.JSONDecodeError, ValueError, GapiError) as exc:
             result = {
@@ -339,6 +539,8 @@ def main() -> int:
                 "restaurant_count": 0,
                 "success_count": 0,
                 "error_count": 0,
+                "api_called_count": 0,
+                "api_skipped_count": 0,
                 "batch_error": str(exc),
             }
             print(f"  batch failed: {exc}", file=sys.stderr)
@@ -351,6 +553,8 @@ def main() -> int:
 
     successful_batches = sum(1 for b in batch_results if b["status"] == "success")
     error_batches = len(batch_results) - successful_batches
+    api_called_count = sum(b.get("api_called_count", 0) for b in batch_results)
+    api_skipped_count = sum(b.get("api_skipped_count", 0) for b in batch_results)
 
     run_record = {
         "run_id": run_started,
@@ -359,6 +563,8 @@ def main() -> int:
         "total_batches_count": len(batch_results),
         "successful_batches_count": successful_batches,
         "error_batches_count": error_batches,
+        "api_called_count": api_called_count,
+        "api_skipped_count": api_skipped_count,
         "batches": batch_results,
     }
 
@@ -366,12 +572,15 @@ def main() -> int:
         manifest = load_manifest(MANIFEST_PATH)
         manifest["runs"].append(run_record)
         save_manifest(MANIFEST_PATH, manifest)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+    except OSError as exc:
         print(f"Warning: could not update manifest: {exc}", file=sys.stderr)
 
     print(
         f"\nRun complete: {successful_batches}/{len(batch_results)} batch(es) fully "
         f"successful. Manifest: {MANIFEST_PATH.name}"
+    )
+    print(
+        f"Google API summary: called={api_called_count}, skipped={api_skipped_count}"
     )
     return 0 if error_batches == 0 else 1
 

@@ -70,9 +70,9 @@ airgrab/.env
 # -----------------------------------------------------------
 # Airgrab pipeline batch data (generated locally)
 # -----------------------------------------------------------
-airgrab/batched_raw_providers_p1/
-airgrab/batched_gapi_details_p2/
-airgrab/batched_scraper_details_p3/
+airgrab/p1_batched_raw_providers/
+airgrab/p2_batched_gapi_details/
+airgrab/p4_batched_scraper_details/
 
 # -----------------------------------------------------------
 # Downloaded Images

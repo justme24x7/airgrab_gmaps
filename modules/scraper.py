@@ -1,9 +1,9 @@
 """
 Selenium scraping for Google Maps place summary (rating + review count).
 
-Batch mode (default): read airgrab/batched_gapi_details_p2/output, enrich each
+Batch mode (default): read airgrab/p2_batched_gapi_details/output, enrich each
 restaurant's ``results`` with rating and total_reviews, write to
-batched_scraper_details_p3/output and output_errors.
+p4_batched_scraper_details/output and output_errors.
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ log = logging.getLogger("scraper")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AIRGRAB_DIR = REPO_ROOT / "airgrab"
-DEFAULT_INPUT_DIR = AIRGRAB_DIR / "batched_gapi_details_p2" / "output"
-DEFAULT_OUTPUT_DIR = AIRGRAB_DIR / "batched_scraper_details_p3" / "output"
-DEFAULT_ERROR_DIR = AIRGRAB_DIR / "batched_scraper_details_p3" / "output_errors"
-MANIFEST_PATH = AIRGRAB_DIR / "batched_scraper_details_p3" / "scraper_run_mainfest.json"
+DEFAULT_INPUT_DIR = AIRGRAB_DIR / "p2_batched_gapi_details" / "output"
+DEFAULT_OUTPUT_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output"
+DEFAULT_ERROR_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output_errors"
+MANIFEST_PATH = AIRGRAB_DIR / "p4_batched_scraper_details" / "scraper_run_mainfest.json"
 BATCH_GLOB = "batch_*.json"
 SUMMARY_WAIT_TIMEOUT = 10
 COOKIE_DISMISS_TIMEOUT = 2
@@ -574,7 +574,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Scrape rating and total_reviews for restaurants in "
-            "batched_gapi_details_p2/output batch files."
+            "p2_batched_gapi_details/output batch files."
         )
     )
     parser.add_argument(

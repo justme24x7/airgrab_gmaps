@@ -12,14 +12,14 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RAW_INPUT = SCRIPT_DIR / "raw_input" / "raw_provider_details.json"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2" / "output"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
 BATCH_GLOB = "batch_*.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Enrich each restaurant JSON in batched_gapi_details_p2/output with "
+            "Enrich each restaurant JSON in p2_batched_gapi_details/output with "
             "address.gps copied from raw_input/raw_provider_details.json."
         )
     )

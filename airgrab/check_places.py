@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2" / "output"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "batched_gapi_details_p2" / "output"
+# DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
 DEFAULT_MIN_PLACES_LENGTH = 1  # len(places) > 0
 DEFAULT_MAX_PLACES_LENGTH = 5
 DEFAULT_MIN_DISTANCE = 0.0

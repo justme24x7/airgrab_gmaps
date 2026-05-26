@@ -1,4 +1,4 @@
 .env
-batched_raw_providers_p1/
-batched_gapi_details_p2/
-batched_scraper_details_p3/
+p1_batched_raw_providers/
+p2_batched_gapi_details/
+p4_batched_scraper_details/
