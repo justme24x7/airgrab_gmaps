@@ -24,6 +24,17 @@ BATCH_GLOB = "batch_*.json"
 CID_URI_TEMPLATE = "https://maps.google.com/?cid={cid}"
 MAX_PLACES_FOR_UNIQUE_MATCH = 5
 MAX_DISTANCE_FOR_UNIQUE_MATCH = 200.0
+EXCLUDED_PLACE_TYPES = frozenset(
+    {
+        "restaurant",
+        "point_of_interest",
+        "food",
+        "food_store",
+        "store",
+        "establishment",
+        "service"
+    }
+)
 
 
 class ProcessGapiError(Exception):
@@ -119,6 +130,40 @@ def relative_to_script(path: Path) -> str:
 
 def _empty_manifest() -> dict[str, Any]:
     return {"runs": []}
+
+
+def load_processed_dict_ids(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    return {str(provider_id) for provider_id in data}
+
+
+def has_successful_gapi_response(provider: dict[str, Any]) -> bool:
+    if provider.get("gapi_error"):
+        return False
+    gapi_response = provider.get("gapi_response")
+    if not isinstance(gapi_response, dict):
+        return False
+    return "places" in gapi_response
+
+
+def should_mark_gapi_called(
+    provider_id: str,
+    provider: dict[str, Any],
+    processed_dict_ids: set[str],
+) -> bool:
+    if provider_id and provider_id in processed_dict_ids:
+        return True
+    return has_successful_gapi_response(provider)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -228,19 +273,47 @@ def extract_cid_from_google_maps_uri(google_maps_uri: str) -> str | None:
     return match.group(1) if match else None
 
 
-def empty_place_result() -> dict[str, str]:
+def empty_place_result() -> dict[str, Any]:
     return {"cid": "", "formatted_google_maps_uri": ""}
 
 
-def build_place_result(place: dict[str, Any]) -> dict[str, str] | None:
+def format_place_types(place: dict[str, Any]) -> list[str]:
+    types = place.get("types")
+    if not isinstance(types, list):
+        return []
+    return [
+        str(place_type).strip()
+        for place_type in types
+        if place_type is not None
+        and str(place_type).strip()
+        and str(place_type).strip() not in EXCLUDED_PLACE_TYPES
+    ]
+
+
+def build_place_result(place: dict[str, Any]) -> dict[str, Any] | None:
     google_maps_uri = str(place.get("googleMapsUri") or "")
     cid = extract_cid_from_google_maps_uri(google_maps_uri)
     if not cid:
         return None
-    return {
+    result: dict[str, Any] = {
         "cid": cid,
         "formatted_google_maps_uri": CID_URI_TEMPLATE.format(cid=cid),
+        "place_types": format_place_types(place),
     }
+    return result
+
+
+def finalize_results(
+    results: dict[str, Any] | None,
+    *,
+    is_gapi_called: bool,
+) -> dict[str, Any] | None:
+    if not is_gapi_called and results is None:
+        return None
+    finalized = dict(results) if results else {}
+    if is_gapi_called:
+        finalized["is_gapi_called"] = True
+    return finalized or None
 
 
 def build_results_from_gapi_response(
@@ -249,7 +322,7 @@ def build_results_from_gapi_response(
     *,
     max_places_for_match: int = MAX_PLACES_FOR_UNIQUE_MATCH,
     max_distance_for_unique_match: float = MAX_DISTANCE_FOR_UNIQUE_MATCH,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     places = gapi_response.get("places")
     if not isinstance(places, list) or not places:
         return None
@@ -274,7 +347,11 @@ def build_results_from_gapi_response(
     return build_place_result(first_place)
 
 
-def process_provider(provider: dict) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def process_provider(
+    provider: dict,
+    *,
+    processed_dict_ids: set[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     record = deepcopy(provider)
     gapi_response = record.get("gapi_response")
     if not isinstance(gapi_response, dict):
@@ -285,6 +362,13 @@ def process_provider(provider: dict) -> tuple[dict[str, Any], dict[str, Any] | N
         return None, record
 
     try:
+        provider_id = str(record.get("id") or "").strip()
+        is_gapi_called = should_mark_gapi_called(
+            provider_id,
+            record,
+            processed_dict_ids,
+        )
+
         places = gapi_response.get("places")
         distance_meters: float | None = None
         if isinstance(places, list) and places and isinstance(places[0], dict):
@@ -299,6 +383,7 @@ def process_provider(provider: dict) -> tuple[dict[str, Any], dict[str, Any] | N
         print(f"    crow_fly_distance_meters: {distance_meters}")
 
         results = build_results_from_gapi_response(record, gapi_response)
+        results = finalize_results(results, is_gapi_called=is_gapi_called)
         if results is not None:
             record["results"] = results
         return record, None
@@ -312,6 +397,7 @@ def process_batch_file(
     *,
     output_dir: Path,
     error_dir: Path,
+    processed_dict_ids: set[str],
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
     batch_id = batch_id_from_path(batch_path)
@@ -340,7 +426,10 @@ def process_batch_file(
             f"  Processing batch {batch_number} provider: {provider_name} "
             f"at index: {index}"
         )
-        success, error = process_provider(provider)
+        success, error = process_provider(
+            provider,
+            processed_dict_ids=processed_dict_ids,
+        )
         if success is not None:
             successes.append(success)
         if error is not None:
@@ -400,6 +489,12 @@ def main(argv: list[str] | None = None) -> int:
     run_started = utc_now_iso()
     batch_results: list[dict[str, Any]] = []
     processed_lookup: dict[str, dict[str, Any]] = {}
+    processed_dict_ids = load_processed_dict_ids(PROCESSED_DICT_PATH)
+    if processed_dict_ids:
+        print(
+            f"Loaded {len(processed_dict_ids)} id(s) from {PROCESSED_DICT_PATH.name} "
+            "for is_gapi_called"
+        )
 
     for batch_path in batch_files:
         print(f"Processing {batch_path.name} ...")
@@ -408,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_path,
                 output_dir=output_dir,
                 error_dir=error_dir,
+                processed_dict_ids=processed_dict_ids,
             )
         except (OSError, json.JSONDecodeError, ValueError, ProcessGapiError) as exc:
             result = {

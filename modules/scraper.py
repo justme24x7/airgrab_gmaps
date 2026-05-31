@@ -718,6 +718,7 @@ def merge_summary_into_results(record: dict, summary: dict[str, Any]) -> None:
         record["results"] = {}
     record["results"]["rating"] = summary.get("rating")
     record["results"]["total_reviews"] = summary.get("total_reviews")
+    record["results"]["is_gmaps_checked"] = True
 
 
 def process_provider(
