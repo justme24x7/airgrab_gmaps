@@ -40,7 +40,7 @@ log = logging.getLogger("scraper")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AIRGRAB_DIR = REPO_ROOT / "airgrab"
-DEFAULT_INPUT_DIR = AIRGRAB_DIR / "p2_batched_gapi_details" / "output"
+DEFAULT_INPUT_DIR = AIRGRAB_DIR / "p3_batched_processed_gapi_details" / "output"
 DEFAULT_OUTPUT_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output"
 DEFAULT_ERROR_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output_errors"
 MANIFEST_PATH = AIRGRAB_DIR / "p4_batched_scraper_details" / "scraper_run_mainfest.json"
@@ -54,9 +54,7 @@ COOKIE_BTN = (
     'button[data-mdc-dialog-action="accept"]'
 )
 
-_SUMMARY_RATING_REVIEWS_RE = re.compile(
-    r"(\d+[.,]\d+)\s*\(\s*([\d][\d,.\s]*)\s*\)"
-)
+_SUMMARY_RATING_REVIEWS_RE = re.compile(r"(\d+[.,]\d+)\s*\(\s*([\d][\d,.\s]*)\s*\)")
 _RATING_ARIA_RE = re.compile(
     r"(?:rated\s+)?(\d+[.,]\d+|\d+)\s*(?:out of|/)\s*5|"
     r"(\d+[.,]\d+|\d+)\s*(?:stars?|sterne|étoiles|estrellas|stelle|"
@@ -114,7 +112,9 @@ def _parse_review_count_from_aria(label: str) -> Optional[int]:
     return None
 
 
-def _parse_summary_rating_reviews_text(text: str) -> Tuple[Optional[float], Optional[int]]:
+def _parse_summary_rating_reviews_text(
+    text: str,
+) -> Tuple[Optional[float], Optional[int]]:
     if not text:
         return None, None
     match = _SUMMARY_RATING_REVIEWS_RE.search(text.replace("\n", " "))
@@ -531,7 +531,11 @@ class GoogleReviewsScraper:
 
         try:
             driver.execute_script("return 1")
-        except (InvalidSessionIdException, NoSuchWindowException, WebDriverException) as exc:
+        except (
+            InvalidSessionIdException,
+            NoSuchWindowException,
+            WebDriverException,
+        ) as exc:
             raise _DriverSessionLost(str(exc)) from exc
 
         self.navigate_to_place(driver, url, wait, place_name=place_name)
@@ -540,7 +544,11 @@ class GoogleReviewsScraper:
 
         try:
             current_url = (driver.current_url or "").lower()
-            if "/sorry/" in current_url or "recaptcha" in current_url or "captcha" in current_url:
+            if (
+                "/sorry/" in current_url
+                or "recaptcha" in current_url
+                or "captcha" in current_url
+            ):
                 raise _RateLimited(f"rate-limit redirect: {current_url}")
         except WebDriverException:
             pass
@@ -923,7 +931,10 @@ def run_batches(
                         "error_count": 0,
                         "batch_error": str(retry_exc),
                     }
-                    print(f"  batch failed after driver restart: {retry_exc}", file=sys.stderr)
+                    print(
+                        f"  batch failed after driver restart: {retry_exc}",
+                        file=sys.stderr,
+                    )
 
             batch_results.append(result)
             print(
@@ -937,8 +948,7 @@ def run_batches(
     successful_batches = sum(1 for b in batch_results if b["status"] == "success")
     error_batches = len(batch_results) - successful_batches
     missing_results_formatted_googleMapsUri_count = sum(
-        b.get("missing_results_formatted_googleMapsUri_count", 0)
-        for b in batch_results
+        b.get("missing_results_formatted_googleMapsUri_count", 0) for b in batch_results
     )
 
     run_record = {

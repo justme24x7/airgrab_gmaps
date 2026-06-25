@@ -17,10 +17,6 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-
-from gapi_cache import GapiCache
-
 REPO_ROOT = SCRIPT_DIR.parent
 ENV_FILES = (REPO_ROOT / ".env", SCRIPT_DIR / ".env")
 PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
@@ -41,7 +37,7 @@ DEFAULT_BATCH_DIR = SCRIPT_DIR / "p1_batched_raw_providers"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
 DEFAULT_ERROR_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output_errors"
 MANIFEST_PATH = SCRIPT_DIR / "p2_batched_gapi_details" / "gapi_run_mainfest.json"
-GAPI_CACHE_DIR = SCRIPT_DIR / "gapi_cache"
+PROCESSED_DICT_PATH = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "gapi_processed_dict.json"
 BATCH_GLOB = "batch_*.json"
 LOCATION_BIAS_RADIUS = 200.0
 
@@ -353,11 +349,34 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
     write_json(path, manifest)
 
 
+def load_processed_lookup(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return {
+        str(provider_id): entry
+        for provider_id, entry in data.items()
+        if isinstance(entry, dict)
+    }
+
+
 def process_provider(
     provider: dict,
     *,
     field_mask: str,
-    cache: GapiCache,
+    processed_lookup: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
     record = deepcopy(provider)
     text_query = format_places_text_query(provider)
@@ -365,11 +384,10 @@ def process_provider(
     location_bias = build_location_bias(provider)
     provider_id = str(provider.get("id") or "").strip()
 
-    if provider_id and cache.should_skip_gapi(provider_id):
-        cached_entry = cache.get_entry(provider_id)
-        if cached_entry:
-            record["gapi_response"] = deepcopy(cached_entry.get("gapi_response", {}))
-            return record, None, True
+    if provider_id and provider_id in processed_lookup:
+        cached_entry = processed_lookup[provider_id]
+        record["gapi_response"] = deepcopy(cached_entry.get("gapi_response", {}))
+        return record, None, True
 
     try:
         record["gapi_response"] = search_text(
@@ -377,12 +395,6 @@ def process_provider(
             field_mask=field_mask,
             location_bias=location_bias,
         )
-        if provider_id:
-            cache.record_gapi_call(
-                provider,
-                record["gapi_response"],
-                called_at=utc_now_iso(),
-            )
         return record, None, False
     except GapiError as exc:
         record["gapi_error"] = exc.to_dict()
@@ -396,7 +408,7 @@ def process_batch_file(
     error_dir: Path,
     field_mask: str,
     delay: float,
-    cache: GapiCache,
+    processed_lookup: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
     batch_id = batch_id_from_path(batch_path)
@@ -404,13 +416,6 @@ def process_batch_file(
     input_file = relative_to_script(batch_path)
 
     providers = load_batch(batch_path)
-    provider_ids = [
-        str(provider.get("id") or "").strip()
-        for provider in providers
-        if isinstance(provider, dict)
-    ]
-    cache.prefetch(provider_ids)
-
     successes: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     api_called_count = 0
@@ -438,11 +443,11 @@ def process_batch_file(
         success, error, was_skipped = process_provider(
             provider,
             field_mask=field_mask,
-            cache=cache,
+            processed_lookup=processed_lookup,
         )
         if was_skipped:
             api_skipped_count += 1
-            print("    google api: skipped (reused gapi_response from gapi_cache)")
+            print("    google api: skipped (reused gapi_response from processed dict)")
         else:
             api_called_count += 1
             print("    google api: called")
@@ -453,11 +458,6 @@ def process_batch_file(
 
         if delay > 0 and index < len(providers) - 1:
             time.sleep(delay)
-
-    try:
-        cache.flush()
-    except OSError as exc:
-        print(f"  warning: could not flush gapi cache: {exc}", file=sys.stderr)
 
     output_path = output_dir / batch_path.name
     error_path = error_dir / batch_path.name
@@ -514,9 +514,7 @@ def main(argv: list[str] | None = None) -> int:
 
     run_started = utc_now_iso()
     batch_results: list[dict[str, Any]] = []
-    cache = GapiCache(GAPI_CACHE_DIR)
-    if cache:
-        print(f"Loaded {len(cache)} provider id(s) from {GAPI_CACHE_DIR.name}/index.json")
+    processed_lookup = load_processed_lookup(PROCESSED_DICT_PATH)
 
     for batch_path in batch_files:
         print(f"Processing {batch_path.name} ...")
@@ -527,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
                 error_dir=error_dir,
                 field_mask=args.field_mask,
                 delay=args.delay,
-                cache=cache,
+                processed_lookup=processed_lookup,
             )
         except (OSError, json.JSONDecodeError, ValueError, GapiError) as exc:
             result = {

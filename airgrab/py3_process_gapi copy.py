@@ -15,15 +15,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-
-from gapi_cache import GapiCache, is_manually_verified_entry
-
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "output"
 DEFAULT_ERROR_DIR = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "output_errors"
 MANIFEST_PATH = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "processed_gapi_run_mainfest.json"
-GAPI_CACHE_DIR = SCRIPT_DIR / "gapi_cache"
+PROCESSED_DICT_PATH = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "gapi_processed_dict.json"
 BATCH_GLOB = "batch_*.json"
 CID_URI_TEMPLATE = "https://maps.google.com/?cid={cid}"
 MAX_PLACES_FOR_UNIQUE_MATCH = 5
@@ -136,6 +132,52 @@ def _empty_manifest() -> dict[str, Any]:
     return {"runs": []}
 
 
+def load_processed_lookup(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(provider_id): entry
+        for provider_id, entry in data.items()
+        if isinstance(entry, dict)
+    }
+
+
+def is_manually_verified_result(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("is_manually_verified") is True
+
+
+def is_manually_verified_entry(entry: dict[str, Any]) -> bool:
+    return is_manually_verified_result(entry.get("result"))
+
+
+def has_successful_gapi_response(provider: dict[str, Any]) -> bool:
+    if provider.get("gapi_error"):
+        return False
+    gapi_response = provider.get("gapi_response")
+    if not isinstance(gapi_response, dict):
+        return False
+    return "places" in gapi_response
+
+
+def should_mark_gapi_called(
+    provider_id: str,
+    provider: dict[str, Any],
+    processed_dict_ids: set[str],
+) -> bool:
+    if provider_id and provider_id in processed_dict_ids:
+        return True
+    return has_successful_gapi_response(provider)
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return _empty_manifest()
@@ -157,13 +199,18 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
     write_json(path, manifest)
 
 
-def _attach_result(record: dict[str, Any], results: dict[str, Any] | None) -> None:
-    if results is None:
-        return
-    result = dict(results)
-    if result.get("is_manually_verified") is not True:
-        result["is_manually_verified"] = False
-    record["results"] = result
+def build_processed_lookup_entry(record: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    provider_id = str(record.get("id") or "").strip()
+    if not provider_id:
+        return None
+
+    entry = {
+        "id": provider_id,
+        "local_id": record.get("local_id", record.get("localid")),
+        "gapi_response": record.get("gapi_response"),
+        "result": record.get("results"),
+    }
+    return provider_id, entry
 
 
 def _to_float(value: Any) -> float | None:
@@ -268,6 +315,19 @@ def build_place_result(place: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
+def finalize_results(
+    results: dict[str, Any] | None,
+    *,
+    is_gapi_called: bool,
+) -> dict[str, Any] | None:
+    if not is_gapi_called and results is None:
+        return None
+    finalized = dict(results) if results else {}
+    if is_gapi_called:
+        finalized["is_gapi_called"] = True
+    return finalized or None
+
+
 def build_results_from_gapi_response(
     provider: dict[str, Any],
     gapi_response: dict[str, Any],
@@ -302,17 +362,18 @@ def build_results_from_gapi_response(
 def process_provider(
     provider: dict,
     *,
-    cache: GapiCache,
+    processed_lookup: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     record = deepcopy(provider)
     provider_id = str(record.get("id") or "").strip()
-    cached_entry = cache.get_entry(provider_id) if provider_id else None
+    cached_entry = processed_lookup.get(provider_id) if provider_id else None
     if cached_entry and is_manually_verified_entry(cached_entry):
         cached_result = cached_entry.get("result")
         if isinstance(cached_result, dict):
             record["results"] = deepcopy(cached_result)
             return record, None
 
+    processed_dict_ids = set(processed_lookup)
     gapi_response = record.get("gapi_response")
     if not isinstance(gapi_response, dict):
         record["process_error"] = ProcessGapiError(
@@ -322,6 +383,12 @@ def process_provider(
         return None, record
 
     try:
+        is_gapi_called = should_mark_gapi_called(
+            provider_id,
+            record,
+            processed_dict_ids,
+        )
+
         places = gapi_response.get("places")
         distance_meters: float | None = None
         if isinstance(places, list) and places and isinstance(places[0], dict):
@@ -336,7 +403,9 @@ def process_provider(
         print(f"    crow_fly_distance_meters: {distance_meters}")
 
         results = build_results_from_gapi_response(record, gapi_response)
-        _attach_result(record, results)
+        results = finalize_results(results, is_gapi_called=is_gapi_called)
+        if results is not None:
+            record["results"] = results
         return record, None
     except Exception as exc:  # noqa: BLE001
         record["process_error"] = ProcessGapiError(str(exc)).to_dict()
@@ -348,7 +417,7 @@ def process_batch_file(
     *,
     output_dir: Path,
     error_dir: Path,
-    cache: GapiCache,
+    processed_lookup: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
     batch_id = batch_id_from_path(batch_path)
@@ -356,13 +425,6 @@ def process_batch_file(
     input_file = relative_to_script(batch_path)
 
     providers = load_batch(batch_path)
-    provider_ids = [
-        str(provider.get("id") or "").strip()
-        for provider in providers
-        if isinstance(provider, dict)
-    ]
-    cache.prefetch(provider_ids)
-
     successes: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -386,18 +448,12 @@ def process_batch_file(
         )
         success, error = process_provider(
             provider,
-            cache=cache,
+            processed_lookup=processed_lookup,
         )
         if success is not None:
             successes.append(success)
-            cache.upsert_from_processed_record(success)
         if error is not None:
             errors.append(error)
-
-    try:
-        cache.flush()
-    except OSError as exc:
-        print(f"  warning: could not flush gapi cache: {exc}", file=sys.stderr)
 
     output_path = output_dir / batch_path.name
     error_path = error_dir / batch_path.name
@@ -452,16 +508,20 @@ def main(argv: list[str] | None = None) -> int:
 
     run_started = utc_now_iso()
     batch_results: list[dict[str, Any]] = []
-    cache = GapiCache(GAPI_CACHE_DIR)
-    manually_verified_count = cache.count_manually_verified()
-    if cache:
+    run_processed_lookup: dict[str, dict[str, Any]] = {}
+    existing_processed_lookup = load_processed_lookup(PROCESSED_DICT_PATH)
+    manually_verified_count = sum(
+        1 for entry in existing_processed_lookup.values() if is_manually_verified_entry(entry)
+    )
+    if existing_processed_lookup:
         print(
-            f"Loaded {len(cache)} provider id(s) from {GAPI_CACHE_DIR.name}/index.json"
+            f"Loaded {len(existing_processed_lookup)} id(s) from {PROCESSED_DICT_PATH.name} "
+            "for is_gapi_called"
         )
     if manually_verified_count:
         print(
             f"Preserving {manually_verified_count} manually verified result(s) "
-            f"in {GAPI_CACHE_DIR.name}"
+            f"from {PROCESSED_DICT_PATH.name}"
         )
 
     for batch_path in batch_files:
@@ -471,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_path,
                 output_dir=output_dir,
                 error_dir=error_dir,
-                cache=cache,
+                processed_lookup=existing_processed_lookup,
             )
         except (OSError, json.JSONDecodeError, ValueError, ProcessGapiError) as exc:
             result = {
@@ -490,6 +550,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  batch failed: {exc}", file=sys.stderr)
 
         batch_results.append(result)
+        if result.get("output_file"):
+            output_batch_path = output_dir / batch_path.name
+            try:
+                processed_records = load_batch(output_batch_path)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                print(
+                    f"  warning: could not read processed output for dictionary: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                for record in processed_records:
+                    if not isinstance(record, dict):
+                        continue
+                    lookup_entry = build_processed_lookup_entry(record)
+                    if lookup_entry is None:
+                        continue
+                    provider_id, entry = lookup_entry
+                    run_processed_lookup[provider_id] = entry
         print(
             f"  {result['status']}: "
             f"{result['success_count']} ok, {result['error_count']} error(s)"
@@ -514,6 +592,17 @@ def main(argv: list[str] | None = None) -> int:
         save_manifest(MANIFEST_PATH, manifest)
     except OSError as exc:
         print(f"Warning: could not update manifest: {exc}", file=sys.stderr)
+
+    try:
+        merged_lookup = dict(existing_processed_lookup)
+        for provider_id, entry in run_processed_lookup.items():
+            existing_entry = merged_lookup.get(provider_id)
+            if existing_entry and is_manually_verified_entry(existing_entry):
+                continue
+            merged_lookup[provider_id] = entry
+        write_json(PROCESSED_DICT_PATH, merged_lookup)
+    except OSError as exc:
+        print(f"Warning: could not write processed dictionary: {exc}", file=sys.stderr)
 
     print(
         f"\nRun complete: {successful_batches}/{len(batch_results)} batch(es) fully "
