@@ -166,6 +166,11 @@ def _attach_result(record: dict[str, Any], results: dict[str, Any] | None) -> No
     record["results"] = result
 
 
+def _strip_gapi_response(record: dict[str, Any]) -> dict[str, Any]:
+    record.pop("gapi_response", None)
+    return record
+
+
 def _to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -389,10 +394,10 @@ def process_batch_file(
             cache=cache,
         )
         if success is not None:
-            successes.append(success)
             cache.upsert_from_processed_record(success)
+            successes.append(_strip_gapi_response(success))
         if error is not None:
-            errors.append(error)
+            errors.append(_strip_gapi_response(error))
 
     try:
         cache.flush()
