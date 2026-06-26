@@ -1,9 +1,27 @@
 """
-Selenium scraping for Google Maps place summary (rating + review count).
+Pipeline step 4: Selenium scrape of Google Maps rating + review count.
 
-Batch mode (default): read airgrab/p2_batched_gapi_details/output, enrich each
-restaurant's ``results`` with rating and total_reviews, write to
-p4_batched_scraper_details/output and output_errors.
+What it does:
+  Reads ``p3_batched_processed_gapi_details/output``, visits each provider's Maps URL,
+  scrapes ``rating`` and ``total_reviews`` into ``results``, and writes to
+  ``p4_batched_scraper_details/output`` and ``output_errors/``.
+
+Overall logic:
+  - Require ``results.cid`` and a formatted Google Maps URI to scrape.
+  - Navigate with Selenium, parse rating/review summary from the page.
+  - On permanently closed detection, mark ``gapi_cache`` and skip future scrapes.
+  - Flush cache updates at end of run.
+
+Skip scraping (return record unchanged):
+  - ``results.rating_type`` == ``"MANUAL"`` on the provider record
+  - ``gapi_cache`` entry top-level ``is_permanently_closed`` == ``true`` → set
+    ``record.is_permanently_closed`` and skip
+  - ``gapi_cache`` entry top-level ``is_manually_blocked`` == ``true`` → set
+    ``record.is_manually_blocked`` and skip
+
+Side effects when permanently closed is detected on the page:
+  - Set top-level ``is_permanently_closed`` == ``true`` on the provider record
+  - Call ``gapi_cache.mark_permanently_closed()`` (top-level flag on cache shard)
 """
 
 from __future__ import annotations
@@ -40,6 +58,10 @@ log = logging.getLogger("scraper")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AIRGRAB_DIR = REPO_ROOT / "airgrab"
+GAPI_CACHE_DIR = AIRGRAB_DIR / "gapi_cache"
+sys.path.insert(0, str(AIRGRAB_DIR))
+from gapi_cache import GapiCache, is_manually_blocked_entry, is_permanently_closed_entry
+
 DEFAULT_INPUT_DIR = AIRGRAB_DIR / "p3_batched_processed_gapi_details" / "output"
 DEFAULT_OUTPUT_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output"
 DEFAULT_ERROR_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output_errors"
@@ -163,6 +185,10 @@ class GoogleReviewsScraper:
         "sınırlı görünüm",
         "ograniczony widok",
         "beperkte weergave",
+    )
+    _PERMANENTLY_CLOSED_PHRASES = (
+        "permanently closed",
+        "closed permanently",
     )
 
     def __init__(
@@ -464,6 +490,27 @@ class GoogleReviewsScraper:
             pass
         return False
 
+    def _is_permanently_closed(self, driver: Chrome) -> bool:
+        texts: list[str] = []
+        try:
+            texts.append(driver.find_element(By.CSS_SELECTOR, 'div[role="main"]').text or "")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            texts.append(driver.find_element(By.TAG_NAME, "body").text or "")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for element in driver.find_elements(By.CSS_SELECTOR, "[aria-label]"):
+                label = element.get_attribute("aria-label") or ""
+                if label:
+                    texts.append(label)
+        except Exception:  # noqa: BLE001
+            pass
+
+        combined = "\n".join(texts).casefold()
+        return any(phrase in combined for phrase in self._PERMANENTLY_CLOSED_PHRASES)
+
     def navigate_to_place(
         self,
         driver: Chrome,
@@ -554,8 +601,21 @@ class GoogleReviewsScraper:
         except WebDriverException:
             pass
 
+        if self._is_permanently_closed(driver):
+            return {
+                "rating": None,
+                "total_reviews": None,
+                "is_permanently_closed": True,
+            }
+
         summary = self._get_rating_and_total_reviews(driver)
         if summary["rating"] is None and summary["total_reviews"] is None:
+            if self._is_permanently_closed(driver):
+                return {
+                    "rating": None,
+                    "total_reviews": None,
+                    "is_permanently_closed": True,
+                }
             raise ScraperError("Could not parse rating or review count from the page")
         return summary
 
@@ -738,13 +798,37 @@ def is_manual_rating_record(record: dict) -> bool:
     )
 
 
+def mark_record_permanently_closed(
+    record: dict[str, Any],
+    *,
+    cache: GapiCache | None,
+) -> None:
+    record["is_permanently_closed"] = True
+    if isinstance(record.get("results"), dict):
+        record["results"]["is_gmaps_checked"] = True
+    if cache is not None:
+        cache.mark_permanently_closed(record, marked_at=utc_now_iso())
+
+
 def process_provider(
     provider: dict,
     scraper: GoogleReviewsScraper,
+    *,
+    cache: GapiCache | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     record = deepcopy(provider)
     if is_manual_rating_record(record):
         return record, None
+
+    provider_id = str(record.get("id") or "").strip()
+    if cache is not None and provider_id:
+        cached_entry = cache.get_entry(provider_id)
+        if cached_entry and is_permanently_closed_entry(cached_entry):
+            record["is_permanently_closed"] = True
+            return record, None
+        if cached_entry and is_manually_blocked_entry(cached_entry):
+            record["is_manually_blocked"] = True
+            return record, None
 
     maps_url = maps_url_from_record(record)
     if not maps_url:
@@ -754,6 +838,9 @@ def process_provider(
 
     try:
         summary = scraper.scrape_place_summary(maps_url, place_name=place_name)
+        if summary.get("is_permanently_closed"):
+            mark_record_permanently_closed(record, cache=cache)
+            return record, None
         merge_summary_into_results(record, summary)
         return record, None
     except (_DriverSessionLost, _RateLimited):
@@ -779,6 +866,7 @@ def process_batch_file(
     output_dir: Path,
     error_dir: Path,
     delay: float,
+    cache: GapiCache | None = None,
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
     batch_start_perf = time.perf_counter()
@@ -815,10 +903,10 @@ def process_batch_file(
             continue
 
         try:
-            success, error = process_provider(provider, scraper)
+            success, error = process_provider(provider, scraper, cache=cache)
         except _DriverSessionLost:
             scraper.restart_driver()
-            success, error = process_provider(provider, scraper)
+            success, error = process_provider(provider, scraper, cache=cache)
         except _RateLimited as exc:
             raise ScraperError(f"Rate limited: {exc}") from exc
 
@@ -886,6 +974,7 @@ def run_batches(
     run_started = utc_now_iso()
     run_start_perf = time.perf_counter()
     batch_results: list[dict[str, Any]] = []
+    cache = GapiCache(GAPI_CACHE_DIR)
     scraper = GoogleReviewsScraper(headless=headless)
 
     try:
@@ -901,6 +990,7 @@ def run_batches(
                     output_dir=output_dir,
                     error_dir=error_dir,
                     delay=delay,
+                    cache=cache,
                 )
             except (OSError, json.JSONDecodeError, ValueError, ScraperError) as exc:
                 result = {
@@ -927,6 +1017,7 @@ def run_batches(
                         output_dir=output_dir,
                         error_dir=error_dir,
                         delay=delay,
+                        cache=cache,
                     )
                 except Exception as retry_exc:  # noqa: BLE001
                     result = {
@@ -956,6 +1047,10 @@ def run_batches(
             )
     finally:
         scraper.stop_driver()
+        try:
+            cache.flush()
+        except OSError as exc:
+            print(f"Warning: could not flush gapi cache: {exc}", file=sys.stderr)
 
     successful_batches = sum(1 for b in batch_results if b["status"] == "success")
     error_batches = len(batch_results) - successful_batches

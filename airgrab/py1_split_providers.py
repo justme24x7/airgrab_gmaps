@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Split raw provider details into numbered batch JSON files."""
+"""Pipeline step 1: split raw providers into numbered batch files.
+
+What it does:
+  Reads ``raw_input/raw_provider_details.json`` (a single JSON array of providers)
+  and writes fixed-size shards to ``p1_batched_raw_providers/batch_NNN.json``.
+
+Overall logic:
+  - Load the full provider list.
+  - Chunk by ``DEFAULT_BATCH_SIZE`` (100).
+  - Write one JSON array per batch file.
+
+Skip / short-circuit logic:
+  None. Every input provider is written to a batch file.
+"""
 
 from __future__ import annotations
 

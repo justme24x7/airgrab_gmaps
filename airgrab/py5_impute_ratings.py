@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
-"""Impute missing provider ratings from same-name peers in p4 outputs."""
+"""Pipeline step 5: impute missing ratings from same-name peers.
+
+What it does:
+  Reads all ``p4_batched_scraper_details/`` batch files (deduped by provider ``id``),
+  builds a peer index of rated providers, then writes imputed outputs to
+  ``p5_imputed_ratings/output``. Imputation failures go to ``output_errors/`` only.
+
+Overall logic:
+  - Pass 1: index peers with valid ``results.rating`` grouped by normalized name
+    (and city when ``GROUP_BY_CITY`` is enabled).
+  - Pass 2: merge each batch from ``output/`` + ``output_errors/``, impute missing
+    ratings, set ``results.rating_type``.
+
+Skip imputation (rating left unchanged; type assigned without peer math):
+  - Top-level ``is_permanently_closed`` == ``true`` → ``rating_type`` ``GOOGLE`` if
+    rating exists, else ``NA``; never ``IMPUTED``
+  - Top-level ``is_manually_blocked`` == ``true`` → ``rating_type`` ``GOOGLE`` if
+    rating exists, else ``NA``; never ``IMPUTED``
+  - ``results.rating_type`` == ``"MANUAL"`` → keep ``MANUAL``
+  - ``results.rating`` already valid (0–5) → ``rating_type`` ``GOOGLE``
+
+Permanently closed and manually blocked providers are also excluded from the peer
+index (not used as peers for imputing others). Requires
+``MINIMUM_PEERS_TO_IMPUTE_RATING`` rated peers
+(same group, excluding self) to assign ``IMPUTED``.
+"""
 
 from __future__ import annotations
 
@@ -164,6 +189,14 @@ def is_manual_rating_record(record: dict[str, Any]) -> bool:
     )
 
 
+def is_permanently_closed_record(record: dict[str, Any]) -> bool:
+    return record.get("is_permanently_closed") is True
+
+
+def is_manually_blocked_record(record: dict[str, Any]) -> bool:
+    return record.get("is_manually_blocked") is True
+
+
 def ensure_results(record: dict[str, Any]) -> dict[str, Any]:
     results = record.get("results")
     if not isinstance(results, dict):
@@ -180,6 +213,12 @@ def build_peer_index(
     for record in records:
         provider_id = provider_id_from_record(record)
         if not provider_id:
+            continue
+
+        if is_permanently_closed_record(record):
+            continue
+
+        if is_manually_blocked_record(record):
             continue
 
         results = record.get("results")
@@ -214,6 +253,20 @@ def impute_record(
     results = ensure_results(record)
     provider_id = provider_id_from_record(record)
 
+    if is_permanently_closed_record(record):
+        if has_rating(record):
+            results["rating_type"] = RATING_TYPE_GOOGLE
+            return RATING_TYPE_GOOGLE
+        results["rating_type"] = RATING_TYPE_NA
+        return RATING_TYPE_NA
+
+    if is_manually_blocked_record(record):
+        if has_rating(record):
+            results["rating_type"] = RATING_TYPE_GOOGLE
+            return RATING_TYPE_GOOGLE
+        results["rating_type"] = RATING_TYPE_NA
+        return RATING_TYPE_NA
+
     if is_manual_rating_record(record):
         results["rating_type"] = RATING_TYPE_MANUAL
         return RATING_TYPE_MANUAL
@@ -236,7 +289,7 @@ def impute_record(
         if peer.total_reviews is not None
     ]
 
-    results["rating"] = round(sum(ratings) / len(ratings), 2)
+    results["rating"] = round(sum(ratings) / len(ratings), 1)
     if review_counts:
         results["total_reviews"] = int(round(sum(review_counts) / len(review_counts)))
     results["rating_type"] = RATING_TYPE_IMPUTED

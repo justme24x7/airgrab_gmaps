@@ -39,6 +39,14 @@ def is_manual_rating_entry(entry: dict[str, Any]) -> bool:
     return is_manual_rating_result(entry.get("result"))
 
 
+def is_permanently_closed_entry(entry: dict[str, Any]) -> bool:
+    return entry.get("is_permanently_closed") is True
+
+
+def is_manually_blocked_entry(entry: dict[str, Any]) -> bool:
+    return entry.get("is_manually_blocked") is True
+
+
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -160,6 +168,10 @@ class GapiCache:
             return False
         if is_manual_rating_entry(entry):
             return True
+        if is_permanently_closed_entry(entry):
+            return True
+        if is_manually_blocked_entry(entry):
+            return True
         if not entry.get("is_gapi_called"):
             return False
         gapi_response = entry.get("gapi_response")
@@ -177,7 +189,11 @@ class GapiCache:
             return
 
         existing = self.get_entry(provider_id)
-        if existing and is_manual_rating_entry(existing):
+        if existing and (
+            is_manual_rating_entry(existing)
+            or is_permanently_closed_entry(existing)
+            or is_manually_blocked_entry(existing)
+        ):
             return
 
         entry: dict[str, Any] = {
@@ -199,6 +215,8 @@ class GapiCache:
         if existing and (
             is_url_manually_verified_entry(existing)
             or is_manual_rating_entry(existing)
+            or is_permanently_closed_entry(existing)
+            or is_manually_blocked_entry(existing)
         ):
             return
 
@@ -221,6 +239,29 @@ class GapiCache:
             if existing
             else None,
             "result": result,
+        }
+        self._upsert_entry(provider_id, entry)
+
+    def mark_permanently_closed(
+        self,
+        provider: dict[str, Any],
+        *,
+        marked_at: str | None = None,
+    ) -> None:
+        provider_id = str(provider.get("id") or "").strip()
+        if not provider_id:
+            return
+
+        existing = self.get_entry(provider_id)
+        entry: dict[str, Any] = {
+            "id": provider_id,
+            "local_id": provider.get("local_id", provider.get("localid")),
+            "is_permanently_closed": True,
+            "permanently_closed_at": marked_at or utc_now_iso(),
+            "is_gapi_called": bool(existing.get("is_gapi_called")) if existing else False,
+            "gapi_called_at": existing.get("gapi_called_at") if existing else None,
+            "gapi_response": existing.get("gapi_response") if existing else None,
+            "result": existing.get("result") if existing else None,
         }
         self._upsert_entry(provider_id, entry)
 

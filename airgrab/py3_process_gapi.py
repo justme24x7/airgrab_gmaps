@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
-"""Process raw GAPI output into final results objects."""
+"""Pipeline step 3: process raw GAPI responses into ``results`` objects.
+
+What it does:
+  Reads ``p2_batched_gapi_details/``, matches GAPI places to each provider (distance,
+  place types), builds a ``results`` object (cid, maps URI, place_types, etc.), and
+  writes to ``p3_batched_processed_gapi_details/``. Updates ``gapi_cache`` with
+  processed results.
+
+Overall logic:
+  - For each provider, check ``gapi_cache`` for protected entries first.
+  - Otherwise require ``gapi_response`` on the record and run place-matching logic.
+  - Strip ``gapi_response`` from written output; persist ``results`` to cache.
+
+Skip normal GAPI processing (copy cached ``result`` or pass through unchanged):
+  - ``gapi_cache`` entry ``result.is_url_manually_verified`` == ``true`` → use cached
+    ``result`` as ``record.results``
+  - ``gapi_cache`` entry ``result.rating_type`` == ``"MANUAL"`` → use cached ``result``
+  - ``gapi_cache`` entry top-level ``is_permanently_closed`` == ``true`` → set
+    ``record.is_permanently_closed`` and return without processing
+  - ``gapi_cache`` entry top-level ``is_manually_blocked`` == ``true`` → set
+    ``record.is_manually_blocked`` and return without processing
+
+Cache upsert is skipped when the success record has ``is_permanently_closed`` == ``true``
+or ``is_manually_blocked`` == ``true``.
+Protected cache entries (URL-verified, MANUAL, permanently closed, manually blocked)
+are not overwritten.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +43,13 @@ from urllib.parse import parse_qs, urlparse
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from gapi_cache import GapiCache, is_manual_rating_entry, is_url_manually_verified_entry
+from gapi_cache import (
+    GapiCache,
+    is_manual_rating_entry,
+    is_manually_blocked_entry,
+    is_permanently_closed_entry,
+    is_url_manually_verified_entry,
+)
 
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "output"
@@ -324,6 +356,14 @@ def process_provider(
             record["results"] = deepcopy(cached_result)
             return record, None
 
+    if cached_entry and is_permanently_closed_entry(cached_entry):
+        record["is_permanently_closed"] = True
+        return record, None
+
+    if cached_entry and is_manually_blocked_entry(cached_entry):
+        record["is_manually_blocked"] = True
+        return record, None
+
     gapi_response = record.get("gapi_response")
     if not isinstance(gapi_response, dict):
         record["process_error"] = ProcessGapiError(
@@ -400,7 +440,10 @@ def process_batch_file(
             cache=cache,
         )
         if success is not None:
-            cache.upsert_from_processed_record(success)
+            if not success.get("is_permanently_closed") and not success.get(
+                "is_manually_blocked"
+            ):
+                cache.upsert_from_processed_record(success)
             successes.append(_strip_gapi_response(success))
         if error is not None:
             errors.append(_strip_gapi_response(error))

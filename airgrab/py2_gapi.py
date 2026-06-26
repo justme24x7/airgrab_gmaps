@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Call Google Places Text Search and store raw GAPI responses."""
+"""Pipeline step 2: Google Places Text Search (GAPI) per provider.
+
+What it does:
+  Reads ``p1_batched_raw_providers/``, calls the Places Text Search API for each
+  provider, and writes records with ``gapi_response`` to ``p2_batched_gapi_details/``.
+  Uses ``gapi_cache/`` to reuse prior responses and avoid repeat API calls.
+
+Overall logic:
+  - Build a text query + location bias from each provider's name/address.
+  - If cache says skip, copy cached ``gapi_response`` onto the record.
+  - Otherwise call GAPI and upsert the response into ``gapi_cache``.
+  - Write successes to ``output/`` and failures to ``output_errors/``.
+
+Skip GAPI call (via ``gapi_cache.should_skip_gapi``):
+  - ``gapi_cache`` entry ``result.rating_type`` == ``"MANUAL"``
+  - ``gapi_cache`` entry top-level ``is_permanently_closed`` == ``true``
+  - ``gapi_cache`` entry top-level ``is_manually_blocked`` == ``true``
+  - ``gapi_cache`` entry has ``is_gapi_called`` == ``true`` and a ``gapi_response`` dict
+
+When skipped, any existing ``gapi_response`` is copied; ``is_permanently_closed`` and
+``is_manually_blocked`` are propagated to the output record when set on the cache entry.
+"""
 
 from __future__ import annotations
 
@@ -369,6 +390,10 @@ def process_provider(
             gapi_response = cached_entry.get("gapi_response")
             if isinstance(gapi_response, dict):
                 record["gapi_response"] = deepcopy(gapi_response)
+            if cached_entry.get("is_permanently_closed") is True:
+                record["is_permanently_closed"] = True
+            if cached_entry.get("is_manually_blocked") is True:
+                record["is_manually_blocked"] = True
         return record, None, True
 
     try:

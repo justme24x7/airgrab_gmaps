@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -18,20 +17,14 @@ BATCH_GLOB = "*.json"
 
 # Comma-separated filters. Leave empty to skip that filter.
 # RATING_BETWEEN: two values as "min,max" (e.g. "3.5,4.5").
-# CENTER_LAT_LNG: one "lat,lng" pair (e.g. "12.85002284,77.65752131").
-# RADIUS_METERS: crow-fly radius in meters from CENTER_LAT_LNG (e.g. "5000").
 # PINCODES = "560087, 560048"
 # PROVIDER_NAMES = "Chef Bakers"
 # RATING_TYPES = "GOOGLE"
 # RATING_BETWEEN = "4.2,4.4"
-# CENTER_LAT_LNG = "12.85002284,77.65752131"
-# RADIUS_METERS = "5000"
-PINCODES = ""
+PINCODES = "560062"
 PROVIDER_NAMES = ""
 RATING_TYPES = ""
 RATING_BETWEEN = ""
-CENTER_LAT_LNG = "12.8851354,77.563325"
-RADIUS_METERS = "4000"
 
 
 # ---- Constants ----
@@ -103,77 +96,6 @@ def parse_rating_between_config(value: str) -> tuple[float, float] | None:
             return None
         bounds.append(rating)
     return min(bounds), max(bounds)
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(str(value).strip())
-    except ValueError:
-        return None
-
-
-def parse_center_lat_lng_config(value: str) -> tuple[float, float] | None:
-    parts = parse_csv_config(value)
-    if len(parts) != 2:
-        return None
-    lat = _to_float(parts[0])
-    lng = _to_float(parts[1])
-    if lat is None or lng is None:
-        return None
-    if not -90 <= lat <= 90 or not -180 <= lng <= 180:
-        return None
-    return lat, lng
-
-
-def parse_radius_meters_config(value: str) -> float | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if "," in text:
-        return None
-    radius = _to_float(text)
-    if radius is None or radius < 0:
-        return None
-    return radius
-
-
-def address_gps_from_record(record: dict[str, Any]) -> tuple[float | None, float | None]:
-    address = record.get("address")
-    if not isinstance(address, dict):
-        return None, None
-
-    gps = address.get("gps")
-    if not isinstance(gps, dict):
-        return None, None
-
-    return _to_float(gps.get("lat")), _to_float(gps.get("long"))
-
-
-def crow_fly_distance_meters(
-    start_lat: float | None,
-    start_lng: float | None,
-    end_lat: float | None,
-    end_lng: float | None,
-) -> float | None:
-    if None in (start_lat, start_lng, end_lat, end_lng):
-        return None
-
-    earth_radius_m = 6_371_000.0
-    lat1 = math.radians(start_lat)
-    lng1 = math.radians(start_lng)
-    lat2 = math.radians(end_lat)
-    lng2 = math.radians(end_lng)
-
-    dlat = lat2 - lat1
-    dlng = lng2 - lng1
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return earth_radius_m * c
 
 
 def parse_rating(value: Any) -> float | None:
@@ -272,27 +194,6 @@ def matches_rating_between_filter(
     return low <= rating <= high
 
 
-def matches_radius_filter(
-    record: dict[str, Any],
-    center_lat_lng: tuple[float, float] | None,
-    radius_meters: float | None,
-) -> bool:
-    if center_lat_lng is None or radius_meters is None:
-        return True
-
-    center_lat, center_lng = center_lat_lng
-    provider_lat, provider_lng = address_gps_from_record(record)
-    distance_meters = crow_fly_distance_meters(
-        center_lat,
-        center_lng,
-        provider_lat,
-        provider_lng,
-    )
-    if distance_meters is None:
-        return False
-    return distance_meters <= radius_meters
-
-
 def filter_providers(
     providers: list[dict[str, Any]],
     *,
@@ -300,8 +201,6 @@ def filter_providers(
     provider_names: list[str],
     rating_types: list[str],
     rating_between: tuple[float, float] | None,
-    center_lat_lng: tuple[float, float] | None,
-    radius_meters: float | None,
 ) -> list[dict[str, Any]]:
     return [
         provider
@@ -310,7 +209,6 @@ def filter_providers(
         and matches_provider_name_filter(provider, provider_names)
         and matches_rating_type_filter(provider, rating_types)
         and matches_rating_between_filter(provider, rating_between)
-        and matches_radius_filter(provider, center_lat_lng, radius_meters)
     ]
 
 
@@ -321,8 +219,6 @@ def build_analytics(
     provider_names: list[str],
     rating_types: list[str],
     rating_between: tuple[float, float] | None,
-    center_lat_lng: tuple[float, float] | None,
-    radius_meters: float | None,
     input_dir: Path,
 ) -> dict[str, Any]:
     google_providers: list[dict[str, Any]] = []
@@ -357,15 +253,6 @@ def build_analytics(
             "provider_names_applied": bool(provider_names),
             "rating_types_applied": bool(rating_types),
             "rating_between_applied": rating_between is not None,
-            "center_lat_lng": (
-                {"lat": center_lat_lng[0], "lng": center_lat_lng[1]}
-                if center_lat_lng is not None
-                else None
-            ),
-            "radius_meters": radius_meters,
-            "radius_filter_applied": (
-                center_lat_lng is not None and radius_meters is not None
-            ),
         },
         "summary": {
             "total_providers": len(providers),
@@ -397,23 +284,6 @@ def main() -> int:
     provider_names = parse_csv_config(PROVIDER_NAMES)
     rating_types = parse_csv_config(RATING_TYPES)
     rating_between = parse_rating_between_config(RATING_BETWEEN)
-    center_lat_lng = parse_center_lat_lng_config(CENTER_LAT_LNG)
-    radius_meters = parse_radius_meters_config(RADIUS_METERS)
-
-    if CENTER_LAT_LNG.strip() and center_lat_lng is None:
-        print(
-            "Error: CENTER_LAT_LNG must be a single lat,lng pair "
-            '(e.g. "12.85,77.65")',
-            file=sys.stderr,
-        )
-        return 1
-    if RADIUS_METERS.strip() and radius_meters is None:
-        print(
-            'Error: RADIUS_METERS must be a single non-negative number '
-            '(e.g. "5000")',
-            file=sys.stderr,
-        )
-        return 1
 
     if not input_dir.is_dir():
         print(f"Error: input directory does not exist: {input_dir}", file=sys.stderr)
@@ -435,8 +305,6 @@ def main() -> int:
         provider_names=provider_names,
         rating_types=rating_types,
         rating_between=rating_between,
-        center_lat_lng=center_lat_lng,
-        radius_meters=radius_meters,
     )
     analytics = build_analytics(
         filtered,
@@ -444,8 +312,6 @@ def main() -> int:
         provider_names=provider_names,
         rating_types=rating_types,
         rating_between=rating_between,
-        center_lat_lng=center_lat_lng,
-        radius_meters=radius_meters,
         input_dir=input_dir,
     )
 
@@ -456,8 +322,9 @@ def main() -> int:
         return 1
 
     summary = analytics["summary"]
-    print(f"Wrote analytics to {output_path}")
-    print(f"Total providers returned: {summary['total_providers']}")
+    print(
+        f"Wrote analytics for {summary['total_providers']} provider(s) to {output_path}"
+    )
     print(
         f"  GOOGLE: {summary['providers_with_google_rating']}, "
         f"IMPUTED: {summary['providers_with_imputed_rating']}, "

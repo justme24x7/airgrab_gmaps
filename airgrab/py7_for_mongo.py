@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""Pipeline step 7: normalize p5 outputs for Mongo import.
+
+What it does:
+  Reads ``p5_imputed_ratings/output`` and ``output_errors/``, merges same-named batch
+  files, normalizes each provider to a slim schema (id, cid, rating, rating_type,
+  etc.), and writes to ``p7_for_mongo/``.
+
+Overall logic:
+  - Load block list from ``p6_block_list/block_list.json``.
+  - For each batch file name present in either input dir, concatenate providers.
+  - Drop block-listed ids, normalize remaining records.
+  - Force ``is_gapi_called`` and ``is_gmaps_checked`` to ``true`` on output.
+
+Exclude from output (not written to ``p7_for_mongo``):
+  - Provider ``id`` present in ``p6_block_list/block_list.json`` ``provider_ids``
+
+No other skip logic. All non-blocked providers are normalized and included.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,9 +28,10 @@ from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-DEFAULT_INPUT_DIR = SCRIPT_DIR / "p4_batched_scraper_details" / "output"
-DEFAULT_ERROR_DIR = SCRIPT_DIR / "p4_batched_scraper_details" / "output_errors"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p5_for_mongo"
+DEFAULT_INPUT_DIR = SCRIPT_DIR / "p5_imputed_ratings" / "output"
+DEFAULT_ERROR_DIR = SCRIPT_DIR / "p5_imputed_ratings" / "output_errors"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p7_for_mongo"
+DEFAULT_BLOCK_LIST_PATH = SCRIPT_DIR / "p6_block_list" / "block_list.json"
 
 CID_URI_TEMPLATE = "https://maps.google.com/?cid={cid}"
 EXCLUDED_PLACE_TYPES = frozenset(
@@ -30,9 +50,10 @@ EXCLUDED_PLACE_TYPES = frozenset(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert p4 batch outputs into Mongo-friendly JSON by keeping only "
+            "Convert p5 imputed-rating batch outputs into Mongo-friendly JSON by keeping only "
             "the required fields, filling missing keys with null, forcing "
-            "is_gapi_called/is_gmaps_checked=true, and merging same-named files "
+            "is_gapi_called/is_gmaps_checked=true, excluding block-listed provider ids, "
+            "and merging same-named files "
             "from output/ + output_errors/ into a single output file."
         )
     )
@@ -60,6 +81,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="*.json",
         help="Glob pattern for batch files (default: *.json)",
     )
+    parser.add_argument(
+        "--block-list",
+        type=Path,
+        default=DEFAULT_BLOCK_LIST_PATH,
+        help=f"Block list JSON path (default: {DEFAULT_BLOCK_LIST_PATH})",
+    )
     return parser.parse_args(argv)
 
 
@@ -82,6 +109,28 @@ def _write_json(path: Path, data: Any) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
+
+
+def _provider_id(record: dict[str, Any]) -> str:
+    return str(record.get("id") or "").strip()
+
+
+def load_block_list(path: Path) -> set[str]:
+    if not path.is_file():
+        print(f"Warning: block list not found at {path}; no providers excluded")
+        return set()
+
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and isinstance(data.get("provider_ids"), list):
+        ids = data["provider_ids"]
+    elif isinstance(data, list):
+        ids = data
+    else:
+        raise ValueError(f"{path}: expected provider_ids list or block-list object")
+
+    return {str(provider_id).strip() for provider_id in ids if str(provider_id).strip()}
 
 
 def _safe_get(d: Any, key: str) -> Any:
@@ -134,6 +183,12 @@ def _normalize_result_item(raw: Any) -> dict[str, Any]:
         or _safe_get(raw, "user_ratings_total")
     )
 
+    rating_type = _safe_get(raw, "rating_type")
+    if isinstance(rating_type, str):
+        rating_type = rating_type.strip().upper() or None
+    else:
+        rating_type = None
+
     formatted_google_maps_uri = (
         _safe_get(raw, "formatted_google_maps_uri")
         or _safe_get(raw, "formattedGoogleMapsUri")
@@ -148,6 +203,7 @@ def _normalize_result_item(raw: Any) -> dict[str, Any]:
         "is_gapi_called": True,
         "rating": rating,
         "total_reviews": total_reviews,
+        "rating_type": rating_type,
         "is_gmaps_checked": True,
     }
 
@@ -187,6 +243,7 @@ def normalize_restaurant(restaurant: Any) -> dict[str, Any]:
         "is_gapi_called": True,
         "rating": _safe_get(first, "rating") if isinstance(first, dict) else None,
         "total_reviews": _safe_get(first, "total_reviews") if isinstance(first, dict) else None,
+        "rating_type": _safe_get(first, "rating_type") if isinstance(first, dict) else None,
         "is_gmaps_checked": True,
     }
 
@@ -205,7 +262,14 @@ def merge_restaurant_lists(lists: Iterable[list[dict[str, Any]]]) -> list[dict[s
     return merged
 
 
-def run(*, input_dir: Path, error_dir: Path, output_dir: Path, glob_pattern: str) -> None:
+def run(
+    *,
+    input_dir: Path,
+    error_dir: Path,
+    output_dir: Path,
+    glob_pattern: str,
+    block_list: set[str],
+) -> None:
     input_files = {p.name: p for p in list_json_files(input_dir, glob_pattern)}
     error_files = {p.name: p for p in list_json_files(error_dir, glob_pattern)}
     all_names = sorted(set(input_files) | set(error_files))
@@ -214,6 +278,11 @@ def run(*, input_dir: Path, error_dir: Path, output_dir: Path, glob_pattern: str
         raise FileNotFoundError(
             f"No JSON files found in {input_dir} or {error_dir} (glob: {glob_pattern})"
         )
+
+    if block_list:
+        print(f"Loaded {len(block_list)} block-listed provider id(s)")
+
+    total_excluded = 0
 
     for name in all_names:
         print(name)
@@ -225,19 +294,30 @@ def run(*, input_dir: Path, error_dir: Path, output_dir: Path, glob_pattern: str
             sources.append(_load_json_array(error_files[name]))
 
         merged = merge_restaurant_lists(sources)
-        normalized = [normalize_restaurant(r) for r in merged]
+        kept = [
+            record
+            for record in merged
+            if _provider_id(record) not in block_list
+        ]
+        total_excluded += len(merged) - len(kept)
+        normalized = [normalize_restaurant(r) for r in kept]
 
         out_path = output_dir / name
         _write_json(out_path, normalized)
 
+    if block_list:
+        print(f"Excluded {total_excluded} block-listed provider record(s)")
+
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    block_list = load_block_list(args.block_list.resolve())
     run(
         input_dir=args.input_dir,
         error_dir=args.error_dir,
         output_dir=args.output_dir,
         glob_pattern=args.glob,
+        block_list=block_list,
     )
 
 
