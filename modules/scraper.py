@@ -47,6 +47,7 @@ MANIFEST_PATH = AIRGRAB_DIR / "p4_batched_scraper_details" / "scraper_run_mainfe
 BATCH_GLOB = "batch_*.json"
 SUMMARY_WAIT_TIMEOUT = 10
 COOKIE_DISMISS_TIMEOUT = 2
+RATING_TYPE_MANUAL = "MANUAL"
 
 COOKIE_BTN = (
     'button[aria-label*="Accept" i],'
@@ -729,11 +730,22 @@ def merge_summary_into_results(record: dict, summary: dict[str, Any]) -> None:
     record["results"]["is_gmaps_checked"] = True
 
 
+def is_manual_rating_record(record: dict) -> bool:
+    results = record.get("results")
+    return (
+        isinstance(results, dict)
+        and str(results.get("rating_type") or "").strip().upper() == RATING_TYPE_MANUAL
+    )
+
+
 def process_provider(
     provider: dict,
     scraper: GoogleReviewsScraper,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     record = deepcopy(provider)
+    if is_manual_rating_record(record):
+        return record, None
+
     maps_url = maps_url_from_record(record)
     if not maps_url:
         return record, None

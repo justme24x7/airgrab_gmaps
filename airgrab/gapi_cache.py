@@ -13,18 +13,30 @@ MAX_PROVIDERS_PER_SHARD = 100
 INDEX_FILENAME = "index.json"
 SHARD_PREFIX = "shard_"
 SHARD_PATTERN = re.compile(r"^shard_(\d+)\.json$")
+RATING_TYPE_MANUAL = "MANUAL"
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def is_manually_verified_result(result: Any) -> bool:
-    return isinstance(result, dict) and result.get("is_manually_verified") is True
+def is_url_manually_verified_result(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("is_url_manually_verified") is True
 
 
-def is_manually_verified_entry(entry: dict[str, Any]) -> bool:
-    return is_manually_verified_result(entry.get("result"))
+def is_url_manually_verified_entry(entry: dict[str, Any]) -> bool:
+    return is_url_manually_verified_result(entry.get("result"))
+
+
+def is_manual_rating_result(result: Any) -> bool:
+    return (
+        isinstance(result, dict)
+        and str(result.get("rating_type") or "").strip().upper() == RATING_TYPE_MANUAL
+    )
+
+
+def is_manual_rating_entry(entry: dict[str, Any]) -> bool:
+    return is_manual_rating_result(entry.get("result"))
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -144,7 +156,11 @@ class GapiCache:
 
     def should_skip_gapi(self, provider_id: str) -> bool:
         entry = self.get_entry(provider_id)
-        if not entry or not entry.get("is_gapi_called"):
+        if not entry:
+            return False
+        if is_manual_rating_entry(entry):
+            return True
+        if not entry.get("is_gapi_called"):
             return False
         gapi_response = entry.get("gapi_response")
         return isinstance(gapi_response, dict)
@@ -161,6 +177,9 @@ class GapiCache:
             return
 
         existing = self.get_entry(provider_id)
+        if existing and is_manual_rating_entry(existing):
+            return
+
         entry: dict[str, Any] = {
             "id": provider_id,
             "local_id": provider.get("local_id", provider.get("localid")),
@@ -177,15 +196,18 @@ class GapiCache:
             return
 
         existing = self.get_entry(provider_id)
-        if existing and is_manually_verified_entry(existing):
+        if existing and (
+            is_url_manually_verified_entry(existing)
+            or is_manual_rating_entry(existing)
+        ):
             return
 
         results = record.get("results")
         result: dict[str, Any] | None = None
         if isinstance(results, dict):
             result = deepcopy(results)
-            if result.get("is_manually_verified") is not True:
-                result["is_manually_verified"] = False
+            if result.get("is_url_manually_verified") is not True:
+                result["is_url_manually_verified"] = False
 
         entry: dict[str, Any] = {
             "id": provider_id,
@@ -240,12 +262,12 @@ class GapiCache:
             shard_files += 1
         return shard_files
 
-    def count_manually_verified(self) -> int:
+    def count_url_manually_verified(self) -> int:
         count = 0
         for shard_name in set(self.index.values()):
             shard = self._load_shard(shard_name)
             for entry in shard.values():
-                if is_manually_verified_entry(entry):
+                if is_url_manually_verified_entry(entry):
                     count += 1
         return count
 

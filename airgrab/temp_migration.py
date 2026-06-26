@@ -82,7 +82,7 @@ def build_result(record: dict[str, Any]) -> dict[str, Any]:
         "cid": None,
         "formatted_google_maps_uri": None,
         "place_types": None,
-        "is_manually_verified": False,
+        "is_url_manually_verified": False,
     }
     if not isinstance(results, dict):
         return result

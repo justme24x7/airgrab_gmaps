@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from gapi_cache import GapiCache, is_manually_verified_entry
+from gapi_cache import GapiCache, is_manual_rating_entry, is_url_manually_verified_entry
 
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "p2_batched_gapi_details" / "output"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "p3_batched_processed_gapi_details" / "output"
@@ -161,8 +161,8 @@ def _attach_result(record: dict[str, Any], results: dict[str, Any] | None) -> No
     if results is None:
         return
     result = dict(results)
-    if result.get("is_manually_verified") is not True:
-        result["is_manually_verified"] = False
+    if result.get("is_url_manually_verified") is not True:
+        result["is_url_manually_verified"] = False
     record["results"] = result
 
 
@@ -312,7 +312,13 @@ def process_provider(
     record = deepcopy(provider)
     provider_id = str(record.get("id") or "").strip()
     cached_entry = cache.get_entry(provider_id) if provider_id else None
-    if cached_entry and is_manually_verified_entry(cached_entry):
+    if cached_entry and is_url_manually_verified_entry(cached_entry):
+        cached_result = cached_entry.get("result")
+        if isinstance(cached_result, dict):
+            record["results"] = deepcopy(cached_result)
+            return record, None
+
+    if cached_entry and is_manual_rating_entry(cached_entry):
         cached_result = cached_entry.get("result")
         if isinstance(cached_result, dict):
             record["results"] = deepcopy(cached_result)
@@ -458,14 +464,14 @@ def main(argv: list[str] | None = None) -> int:
     run_started = utc_now_iso()
     batch_results: list[dict[str, Any]] = []
     cache = GapiCache(GAPI_CACHE_DIR)
-    manually_verified_count = cache.count_manually_verified()
+    url_manually_verified_count = cache.count_url_manually_verified()
     if cache:
         print(
             f"Loaded {len(cache)} provider id(s) from {GAPI_CACHE_DIR.name}/index.json"
         )
-    if manually_verified_count:
+    if url_manually_verified_count:
         print(
-            f"Preserving {manually_verified_count} manually verified result(s) "
+            f"Preserving {url_manually_verified_count} URL manually verified result(s) "
             f"in {GAPI_CACHE_DIR.name}"
         )
 

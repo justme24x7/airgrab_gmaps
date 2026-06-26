@@ -287,9 +287,7 @@ def list_batch_files(batch_dir: Path) -> list[Path]:
         raise FileNotFoundError(f"Batch directory not found: {batch_dir}")
     files = sorted(batch_dir.glob(BATCH_GLOB))
     if not files:
-        raise FileNotFoundError(
-            f"No batch files matching {BATCH_GLOB} in {batch_dir}"
-        )
+        raise FileNotFoundError(f"No batch files matching {BATCH_GLOB} in {batch_dir}")
     return files
 
 
@@ -368,8 +366,10 @@ def process_provider(
     if provider_id and cache.should_skip_gapi(provider_id):
         cached_entry = cache.get_entry(provider_id)
         if cached_entry:
-            record["gapi_response"] = deepcopy(cached_entry.get("gapi_response", {}))
-            return record, None, True
+            gapi_response = cached_entry.get("gapi_response")
+            if isinstance(gapi_response, dict):
+                record["gapi_response"] = deepcopy(gapi_response)
+        return record, None, True
 
     try:
         record["gapi_response"] = search_text(
@@ -516,7 +516,9 @@ def main(argv: list[str] | None = None) -> int:
     batch_results: list[dict[str, Any]] = []
     cache = GapiCache(GAPI_CACHE_DIR)
     if cache:
-        print(f"Loaded {len(cache)} provider id(s) from {GAPI_CACHE_DIR.name}/index.json")
+        print(
+            f"Loaded {len(cache)} provider id(s) from {GAPI_CACHE_DIR.name}/index.json"
+        )
 
     for batch_path in batch_files:
         print(f"Processing {batch_path.name} ...")
@@ -581,9 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         f"\nRun complete: {successful_batches}/{len(batch_results)} batch(es) fully "
         f"successful. Manifest: {MANIFEST_PATH.name}"
     )
-    print(
-        f"Google API summary: called={api_called_count}, skipped={api_skipped_count}"
-    )
+    print(f"Google API summary: called={api_called_count}, skipped={api_skipped_count}")
     return 0 if error_batches == 0 else 1
 
 
