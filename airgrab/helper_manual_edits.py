@@ -2,7 +2,7 @@
 """Apply manual gapi_cache edits from airgrab/manual_inputs JSON files.
 
 Reads, in order:
-  1. manual_gmaps_uri.json   — formatted_google_maps_uri + URL verified flags
+  1. manual_gmaps_uri.json   — formatted_google_maps_uri, place_id + URL verified flags
   2. manual_ratings.json   — rating, total_reviews + MANUAL rating_type
   3. manual_block.json       — block_reason + is_manually_blocked
 
@@ -51,9 +51,9 @@ def load_manual_providers(path: Path) -> dict[str, dict[str, Any]]:
     return providers
 
 
-def _results_dict(record: dict[str, Any]) -> dict[str, Any]:
-    results = record.get("results")
-    return results if isinstance(results, dict) else {}
+def _result_dict(record: dict[str, Any]) -> dict[str, Any]:
+    result = record.get("result")
+    return result if isinstance(result, dict) else {}
 
 
 def build_base_entry(
@@ -78,13 +78,17 @@ def build_base_entry(
 
 
 def apply_gmaps_uri_patch(entry: dict[str, Any], manual_record: dict[str, Any]) -> None:
-    results = _results_dict(manual_record)
-    uri = results.get("formatted_google_maps_uri")
-    if uri is None:
+    result_data = _result_dict(manual_record)
+    uri = result_data.get("formatted_google_maps_uri")
+    place_id = result_data.get("place_id")
+    if uri is None or place_id is None:
         return
 
     uri = str(uri).strip()
-    if not uri:
+    place_id = str(place_id).strip()
+    if place_id.startswith("places/"):
+        place_id = place_id.removeprefix("places/").strip()
+    if not uri or not place_id:
         return
 
     result = entry.setdefault("result", {})
@@ -93,22 +97,23 @@ def apply_gmaps_uri_patch(entry: dict[str, Any], manual_record: dict[str, Any]) 
         entry["result"] = result
 
     result["formatted_google_maps_uri"] = uri
+    result["place_id"] = place_id
     result["is_url_manually_verified"] = True
     entry["is_gapi_called"] = True
 
 
 def apply_ratings_patch(entry: dict[str, Any], manual_record: dict[str, Any]) -> None:
-    results = _results_dict(manual_record)
+    result_data = _result_dict(manual_record)
 
     result = entry.setdefault("result", {})
     if not isinstance(result, dict):
         result = {}
         entry["result"] = result
 
-    if "rating" in results:
-        result["rating"] = results["rating"]
-    if "total_reviews" in results:
-        result["total_reviews"] = results["total_reviews"]
+    if "rating" in result_data:
+        result["rating"] = result_data["rating"]
+    if "total_reviews" in result_data:
+        result["total_reviews"] = result_data["total_reviews"]
 
     result["rating_type"] = RATING_TYPE_MANUAL
     entry["is_gapi_called"] = True
@@ -117,7 +122,7 @@ def apply_ratings_patch(entry: dict[str, Any], manual_record: dict[str, Any]) ->
 def apply_block_patch(entry: dict[str, Any], manual_record: dict[str, Any]) -> None:
     block_reason = manual_record.get("block_reason")
     if block_reason is None:
-        block_reason = _results_dict(manual_record).get("block_reason")
+        block_reason = _result_dict(manual_record).get("block_reason")
     if block_reason is not None:
         entry["block_reason"] = block_reason
 

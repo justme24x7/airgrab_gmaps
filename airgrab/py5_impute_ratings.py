@@ -7,18 +7,18 @@ What it does:
   ``p5_imputed_ratings/output``. Imputation failures go to ``output_errors/`` only.
 
 Overall logic:
-  - Pass 1: index peers with valid ``results.rating`` grouped by normalized name
+  - Pass 1: index peers with valid ``result.rating`` grouped by normalized name
     (and city when ``GROUP_BY_CITY`` is enabled).
   - Pass 2: merge each batch from ``output/`` + ``output_errors/``, impute missing
-    ratings, set ``results.rating_type``.
+    ratings, set ``result.rating_type``.
 
 Skip imputation (rating left unchanged; type assigned without peer math):
   - Top-level ``is_permanently_closed`` == ``true`` → ``rating_type`` ``GOOGLE`` if
     rating exists, else ``NA``; never ``IMPUTED``
   - Top-level ``is_manually_blocked`` == ``true`` → ``rating_type`` ``GOOGLE`` if
     rating exists, else ``NA``; never ``IMPUTED``
-  - ``results.rating_type`` == ``"MANUAL"`` → keep ``MANUAL``
-  - ``results.rating`` already valid (0–5) → ``rating_type`` ``GOOGLE``
+  - ``result.rating_type`` == ``"MANUAL"`` → keep ``MANUAL``
+  - ``result.rating`` already valid (0–5) → ``rating_type`` ``GOOGLE``
 
 Permanently closed and manually blocked providers are also excluded from the peer
 index (not used as peers for imputing others). Requires
@@ -64,7 +64,7 @@ class PeerRating:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read p4 batch outputs, impute missing results.rating from peers with "
+            "Read p4 batch outputs, impute missing result.rating from peers with "
             "the same name (and city when GROUP_BY_CITY is enabled), merge each batch from output/ and "
             "output_errors/ into p5_imputed_ratings/output, and write imputation "
             "failures only to p5_imputed_ratings/output_errors."
@@ -175,17 +175,17 @@ def parse_total_reviews(value: Any) -> float | None:
 
 
 def has_rating(record: dict[str, Any]) -> bool:
-    results = record.get("results")
-    if not isinstance(results, dict):
+    result = record.get("result")
+    if not isinstance(result, dict):
         return False
-    return parse_rating(results.get("rating")) is not None
+    return parse_rating(result.get("rating")) is not None
 
 
 def is_manual_rating_record(record: dict[str, Any]) -> bool:
-    results = record.get("results")
+    result = record.get("result")
     return (
-        isinstance(results, dict)
-        and str(results.get("rating_type") or "").strip().upper() == RATING_TYPE_MANUAL
+        isinstance(result, dict)
+        and str(result.get("rating_type") or "").strip().upper() == RATING_TYPE_MANUAL
     )
 
 
@@ -197,12 +197,12 @@ def is_manually_blocked_record(record: dict[str, Any]) -> bool:
     return record.get("is_manually_blocked") is True
 
 
-def ensure_results(record: dict[str, Any]) -> dict[str, Any]:
-    results = record.get("results")
-    if not isinstance(results, dict):
-        results = {}
-        record["results"] = results
-    return results
+def ensure_result(record: dict[str, Any]) -> dict[str, Any]:
+    result = record.get("result")
+    if not isinstance(result, dict):
+        result = {}
+        record["result"] = result
+    return result
 
 
 def build_peer_index(
@@ -221,11 +221,11 @@ def build_peer_index(
         if is_manually_blocked_record(record):
             continue
 
-        results = record.get("results")
-        if not isinstance(results, dict):
+        result = record.get("result")
+        if not isinstance(result, dict):
             continue
 
-        rating = parse_rating(results.get("rating"))
+        rating = parse_rating(result.get("rating"))
         if rating is None:
             continue
 
@@ -237,7 +237,7 @@ def build_peer_index(
             PeerRating(
                 provider_id=provider_id,
                 rating=rating,
-                total_reviews=parse_total_reviews(results.get("total_reviews")),
+                total_reviews=parse_total_reviews(result.get("total_reviews")),
             )
         )
 
@@ -250,36 +250,36 @@ def impute_record(
     *,
     min_peers: int,
 ) -> str:
-    results = ensure_results(record)
+    result = ensure_result(record)
     provider_id = provider_id_from_record(record)
 
     if is_permanently_closed_record(record):
         if has_rating(record):
-            results["rating_type"] = RATING_TYPE_GOOGLE
+            result["rating_type"] = RATING_TYPE_GOOGLE
             return RATING_TYPE_GOOGLE
-        results["rating_type"] = RATING_TYPE_NA
+        result["rating_type"] = RATING_TYPE_NA
         return RATING_TYPE_NA
 
     if is_manually_blocked_record(record):
         if has_rating(record):
-            results["rating_type"] = RATING_TYPE_GOOGLE
+            result["rating_type"] = RATING_TYPE_GOOGLE
             return RATING_TYPE_GOOGLE
-        results["rating_type"] = RATING_TYPE_NA
+        result["rating_type"] = RATING_TYPE_NA
         return RATING_TYPE_NA
 
     if is_manual_rating_record(record):
-        results["rating_type"] = RATING_TYPE_MANUAL
+        result["rating_type"] = RATING_TYPE_MANUAL
         return RATING_TYPE_MANUAL
 
     if has_rating(record):
-        results["rating_type"] = RATING_TYPE_GOOGLE
+        result["rating_type"] = RATING_TYPE_GOOGLE
         return RATING_TYPE_GOOGLE
 
     peers = peer_index.get(group_key(record), [])
     rated_peers = [peer for peer in peers if peer.provider_id != provider_id]
 
     if len(rated_peers) < min_peers:
-        results["rating_type"] = RATING_TYPE_NA
+        result["rating_type"] = RATING_TYPE_NA
         return RATING_TYPE_NA
 
     ratings = [peer.rating for peer in rated_peers]
@@ -289,10 +289,10 @@ def impute_record(
         if peer.total_reviews is not None
     ]
 
-    results["rating"] = round(sum(ratings) / len(ratings), 1)
+    result["rating"] = round(sum(ratings) / len(ratings), 1)
     if review_counts:
-        results["total_reviews"] = int(round(sum(review_counts) / len(review_counts)))
-    results["rating_type"] = RATING_TYPE_IMPUTED
+        result["total_reviews"] = int(round(sum(review_counts) / len(review_counts)))
+    result["rating_type"] = RATING_TYPE_IMPUTED
     return RATING_TYPE_IMPUTED
 
 
@@ -547,11 +547,11 @@ def main(argv: list[str] | None = None) -> int:
         total_na += batch_stats["rating_type_na_count"]
         total_impute_errors += batch_stats["impute_error_count"]
         for record in successes:
-            results = record.get("results")
-            if not isinstance(results, dict):
+            result = record.get("result")
+            if not isinstance(result, dict):
                 missing_rating_after += 1
                 continue
-            if parse_rating(results.get("rating")) is None:
+            if parse_rating(result.get("rating")) is None:
                 missing_rating_after += 1
 
         print(

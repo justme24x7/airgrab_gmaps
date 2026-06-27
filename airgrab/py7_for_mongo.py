@@ -159,7 +159,7 @@ def _normalize_result_item(raw: Any) -> dict[str, Any]:
         raw = {}
 
     # Support two shapes:
-    # - already-processed `results[]` item (has cid/place_types/etc)
+    # - already-processed `result` item (has cid/place_types/etc)
     # - GAPI "place" object (has googleMapsUri, types, userRatingCount)
     google_maps_uri = _safe_get(raw, "googleMapsUri") or _safe_get(raw, "google_maps_uri")
     cid = _safe_get(raw, "cid") or _cid_from_google_maps_uri(google_maps_uri)
@@ -208,12 +208,12 @@ def _normalize_result_item(raw: Any) -> dict[str, Any]:
     }
 
 
-def _extract_results(restaurant: dict[str, Any]) -> list[dict[str, Any]] | None:
-    results = _safe_get(restaurant, "results")
-    if isinstance(results, dict):
-        return [_normalize_result_item(results)]
-    if isinstance(results, list):
-        return [_normalize_result_item(r) for r in results]
+def _extract_result(restaurant: dict[str, Any]) -> list[dict[str, Any]] | None:
+    result = _safe_get(restaurant, "result")
+    if isinstance(result, dict):
+        return [_normalize_result_item(result)]
+    if isinstance(result, list):
+        return [_normalize_result_item(r) for r in result]
 
     gapi_response = _safe_get(restaurant, "gapi_response")
     if isinstance(gapi_response, dict):
@@ -228,8 +228,8 @@ def normalize_restaurant(restaurant: Any) -> dict[str, Any]:
     if not isinstance(restaurant, dict):
         restaurant = {}
 
-    results = _extract_results(restaurant) or []
-    first = results[0] if results else None
+    extracted = _extract_result(restaurant) or []
+    first = extracted[0] if extracted else None
 
     return {
         "id": _safe_get(restaurant, "id"),

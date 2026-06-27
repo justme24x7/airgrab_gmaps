@@ -189,17 +189,17 @@ def parse_rating(value: Any) -> float | None:
 
 
 def rating_from_record(record: dict[str, Any]) -> float | None:
-    results = record.get("results")
-    if not isinstance(results, dict):
+    result = record.get("result")
+    if not isinstance(result, dict):
         return None
-    return parse_rating(results.get("rating"))
+    return parse_rating(result.get("rating"))
 
 
 def rating_type_from_record(record: dict[str, Any]) -> str:
-    results = record.get("results")
-    if not isinstance(results, dict):
+    result = record.get("result")
+    if not isinstance(result, dict):
         return RATING_TYPE_NA
-    rating_type = str(results.get("rating_type") or "").strip().upper()
+    rating_type = str(result.get("rating_type") or "").strip().upper()
     if rating_type in VALID_RATING_TYPES:
         return rating_type
     return RATING_TYPE_NA

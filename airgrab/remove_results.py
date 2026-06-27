@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove results objects from p2 GAPI output batch files in place."""
+"""Remove result objects from p2 GAPI output batch files in place."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ BATCH_GLOB = "batch_*.json"
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Remove the results object from each restaurant record in "
+            "Remove the result object from each restaurant record in "
             "p2_batched_gapi_details/output batch files."
         )
     )
@@ -62,7 +62,10 @@ def process_batch_file(batch_path: Path) -> tuple[int, int]:
         if not isinstance(provider, dict):
             continue
         scanned_count += 1
-        if "results" in provider:
+        if "result" in provider:
+            provider.pop("result", None)
+            removed_count += 1
+        elif "results" in provider:
             provider.pop("results", None)
             removed_count += 1
 
@@ -93,12 +96,12 @@ def main(argv: list[str] | None = None) -> int:
         total_removed += removed_count
         total_scanned += scanned_count
         print(
-            f"{batch_path.name}: removed results from {removed_count} / "
+            f"{batch_path.name}: removed result from {removed_count} / "
             f"{scanned_count} restaurant(s)"
         )
 
     print(
-        f"\nDone. Removed results from {total_removed} / "
+        f"\nDone. Removed result from {total_removed} / "
         f"{total_scanned} restaurant(s)."
     )
     return 0

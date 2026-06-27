@@ -3,17 +3,22 @@ Pipeline step 4: Selenium scrape of Google Maps rating + review count.
 
 What it does:
   Reads ``p3_batched_processed_gapi_details/output``, visits each provider's Maps URL,
-  scrapes ``rating`` and ``total_reviews`` into ``results``, and writes to
+  scrapes ``rating`` and ``total_reviews`` into ``result``, and writes to
   ``p4_batched_scraper_details/output`` and ``output_errors/``.
 
 Overall logic:
-  - Require ``results.cid`` and a formatted Google Maps URI to scrape.
-  - Navigate with Selenium, parse rating/review summary from the page.
+  - Require a formatted Google Maps URI to scrape.
+  - Navigate with Selenium (browser/headless set via ``SCRAPE_BROWSER`` /
+    ``SCRAPE_HEADLESS`` or CLI ``--browser`` / ``--headless``).
+  - Parse rating/review summary from the page.
   - On permanently closed detection, mark ``gapi_cache`` and skip future scrapes.
+  - On Google rate-limit (/sorry/, CAPTCHA), try clicking the reCAPTCHA checkbox,
+    then cooldown + browser restart + retry; the batch fails with no output if
+    retries are exhausted.
   - Flush cache updates at end of run.
 
 Skip scraping (return record unchanged):
-  - ``results.rating_type`` == ``"MANUAL"`` on the provider record
+  - ``result.rating_type`` == ``"MANUAL"`` on the provider record
   - ``gapi_cache`` entry top-level ``is_permanently_closed`` == ``true`` → set
     ``record.is_permanently_closed`` and skip
   - ``gapi_cache`` entry top-level ``is_manually_blocked`` == ``true`` → set
@@ -62,6 +67,20 @@ GAPI_CACHE_DIR = AIRGRAB_DIR / "gapi_cache"
 sys.path.insert(0, str(AIRGRAB_DIR))
 from gapi_cache import GapiCache, is_manually_blocked_entry, is_permanently_closed_entry
 
+# --- Batch pipeline tuning ---
+SCRAPE_DELAY_SECONDS = 5
+RATE_LIMIT_COOLDOWN_SECONDS = 120.0
+RATE_LIMIT_RETRIES = 2
+RECAPTCHA_AUTO_CLICK = True
+RECAPTCHA_RESOLVE_TIMEOUT_SECONDS = 15.0
+SCRAPE_HEADLESS = True  # True = run without a visible browser window (not supported for safari)
+SCRAPE_BROWSER = "chrome"  # chrome, edge, firefox, or safari
+# Safari (macOS only): enable Develop menu, then Developer → "Allow remote automation".
+# Run once in Terminal: safaridriver --enable
+# For Google Maps scraping, chrome with SCRAPE_HEADLESS=False is usually more reliable.
+
+VALID_SCRAPE_BROWSERS = frozenset({"chrome", "edge", "firefox", "safari"})
+
 DEFAULT_INPUT_DIR = AIRGRAB_DIR / "p3_batched_processed_gapi_details" / "output"
 DEFAULT_OUTPUT_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output"
 DEFAULT_ERROR_DIR = AIRGRAB_DIR / "p4_batched_scraper_details" / "output_errors"
@@ -90,6 +109,21 @@ _REVIEW_COUNT_ARIA_RE = re.compile(
     r"reseñas?|recensioni?|avaliações?|отзыв|レビュー|리뷰|评论|評論|"
     r"ביקורות|รีวิว|yorumlar?|değerlendirme|beoordelingen?|recenz)",
     re.IGNORECASE,
+)
+
+
+def normalize_scrape_browser(value: str) -> str:
+    browser = str(value or "").strip().lower()
+    if browser not in VALID_SCRAPE_BROWSERS:
+        allowed = ", ".join(sorted(VALID_SCRAPE_BROWSERS))
+        raise ValueError(f"Invalid browser {value!r}; choose from: {allowed}")
+    return browser
+
+
+SAFARI_REMOTE_AUTOMATION_HINT = (
+    "Safari WebDriver is not enabled. On macOS: open Safari → Settings → "
+    "Advanced → enable developer features, then Settings → Developer → "
+    "turn on 'Allow remote automation'. In Terminal run: safaridriver --enable"
 )
 
 
@@ -165,6 +199,152 @@ class _RateLimited(Exception):
     """Google served CAPTCHA / 429 / limited-view page."""
 
 
+def _is_rate_limited_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return (
+        "/sorry/" in lowered
+        or "recaptcha" in lowered
+        or "captcha" in lowered
+    )
+
+
+def _page_has_recaptcha_challenge(driver: Chrome) -> bool:
+    try:
+        body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+    except WebDriverException:
+        body_text = ""
+
+    if "unusual traffic" in body_text and "robot" in body_text:
+        return True
+    if "i'm not a robot" in body_text or "im not a robot" in body_text:
+        return True
+
+    recaptcha_iframe_selectors = (
+        "iframe[src*='google.com/recaptcha']",
+        "iframe[src*='recaptcha/api2/anchor']",
+        "iframe[title*='reCAPTCHA']",
+        "iframe[title*='recaptcha']",
+    )
+    for selector in recaptcha_iframe_selectors:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, selector):
+                return True
+        except WebDriverException:
+            continue
+    return False
+
+
+def _try_click_recaptcha_checkbox(driver: Chrome) -> bool:
+    iframe_selectors = (
+        "iframe[src*='google.com/recaptcha']",
+        "iframe[src*='recaptcha/api2/anchor']",
+        "iframe[title*='reCAPTCHA']",
+        "iframe[title*='recaptcha']",
+    )
+    checkbox_selectors = (
+        "#recaptcha-anchor",
+        ".recaptcha-checkbox-border",
+        "span.recaptcha-checkbox",
+    )
+
+    for iframe_selector in iframe_selectors:
+        try:
+            iframes = driver.find_elements(By.CSS_SELECTOR, iframe_selector)
+        except WebDriverException:
+            continue
+
+        for iframe in iframes:
+            try:
+                driver.switch_to.frame(iframe)
+                for checkbox_selector in checkbox_selectors:
+                    checkboxes = driver.find_elements(
+                        By.CSS_SELECTOR,
+                        checkbox_selector,
+                    )
+                    if not checkboxes:
+                        continue
+                    checkbox = checkboxes[0]
+                    try:
+                        checkbox.click()
+                    except WebDriverException:
+                        driver.execute_script("arguments[0].click();", checkbox)
+                    log.info("Clicked reCAPTCHA checkbox")
+                    return True
+            except WebDriverException as exc:
+                log.debug("reCAPTCHA iframe click failed: %s", exc)
+            finally:
+                try:
+                    driver.switch_to.default_content()
+                except WebDriverException:
+                    pass
+    return False
+
+
+def _resolve_rate_limit_page(driver: Chrome) -> bool:
+    """Try to clear a Google unusual-traffic / reCAPTCHA page. Returns True if clear."""
+    try:
+        current_url = driver.current_url or ""
+    except WebDriverException:
+        current_url = ""
+
+    if not _is_rate_limited_url(current_url) and not _page_has_recaptcha_challenge(
+        driver
+    ):
+        return True
+
+    if not RECAPTCHA_AUTO_CLICK:
+        return False
+
+    log.info("Google reCAPTCHA / unusual-traffic page detected; attempting checkbox click")
+    if not _try_click_recaptcha_checkbox(driver):
+        log.warning("reCAPTCHA checkbox not found or not clickable")
+        return False
+
+    deadline = time.time() + RECAPTCHA_RESOLVE_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            current_url = driver.current_url or ""
+        except WebDriverException:
+            current_url = ""
+        if not _is_rate_limited_url(current_url) and not _page_has_recaptcha_challenge(
+            driver
+        ):
+            log.info("reCAPTCHA challenge cleared")
+            return True
+
+    log.warning(
+        "reCAPTCHA still present after %.0fs (image challenge may require manual solve)",
+        RECAPTCHA_RESOLVE_TIMEOUT_SECONDS,
+    )
+    return False
+
+
+def _raise_if_rate_limited(driver: Chrome) -> None:
+    if _resolve_rate_limit_page(driver):
+        return
+
+    try:
+        current_url = driver.current_url or ""
+    except WebDriverException:
+        return
+    if _is_rate_limited_url(current_url) or _page_has_recaptcha_challenge(driver):
+        raise _RateLimited(f"rate-limit redirect: {current_url}")
+
+
+def recover_from_rate_limit(
+    scraper: "GoogleReviewsScraper",
+    *,
+    cooldown_seconds: float,
+) -> None:
+    log.warning(
+        "Rate limited by Google — sleeping %.0fs and restarting browser",
+        cooldown_seconds,
+    )
+    time.sleep(cooldown_seconds)
+    scraper.restart_driver()
+
+
 class GoogleReviewsScraper:
     """Scrape place-level rating and total review count from Google Maps."""
 
@@ -196,10 +376,18 @@ class GoogleReviewsScraper:
         config: Dict[str, Any] | None = None,
         cancel_event: threading.Event | None = None,
         *,
-        headless: bool = True,
+        headless: bool | None = None,
+        browser: str | None = None,
     ) -> None:
         config = config or {}
+        if headless is None:
+            headless = SCRAPE_HEADLESS
+        if browser is None:
+            browser = SCRAPE_BROWSER
         self.headless = bool(config.get("headless", headless))
+        self.browser = normalize_scrape_browser(
+            str(config.get("browser", browser))
+        )
         self.url = config.get("url")
         self.cancel_event = cancel_event or threading.Event()
         self.place_rating: Optional[float] = None
@@ -209,32 +397,56 @@ class GoogleReviewsScraper:
         self._maps_session_ready = False
 
     def setup_driver(self, headless: bool | None = None) -> Chrome:
-        """Set up SeleniumBase UC Mode Chrome driver."""
+        """Set up SeleniumBase driver for the configured browser."""
         if headless is None:
             headless = self.headless
 
+        browser = self.browser
         log.info("Platform: %s", platform.platform())
         log.info("Python version: %s", platform.python_version())
-        log.info("Using SeleniumBase UC Mode (headless=%s)", headless)
+
+        if browser == "safari":
+            if sys.platform != "darwin":
+                raise ScraperError("Safari WebDriver is only supported on macOS")
+            if headless:
+                log.warning(
+                    "Safari does not support headless mode; running with a visible window"
+                )
+                headless = False
+
+        log.info(
+            "Using SeleniumBase Driver (browser=%s, headless=%s)",
+            browser,
+            headless,
+        )
+
+        driver_kwargs: dict[str, Any] = {
+            "browser": browser,
+            "headless": headless,
+            "page_load_strategy": "normal",
+        }
+
+        if browser == "chrome":
+            driver_kwargs["uc"] = True
+            driver_kwargs["incognito"] = True
+        elif browser == "edge":
+            driver_kwargs["incognito"] = True
 
         in_container = os.environ.get("CHROME_BIN") is not None
-        if in_container:
+        if in_container and browser == "chrome":
             chrome_binary = os.environ.get("CHROME_BIN")
-            kwargs: dict[str, Any] = {
-                "uc": True,
-                "headless": headless,
-                "page_load_strategy": "normal",
-            }
             if chrome_binary and os.path.exists(chrome_binary):
-                kwargs["binary_location"] = chrome_binary
-            driver = Driver(**kwargs)
-        else:
-            driver = Driver(
-                uc=True,
-                headless=headless,
-                page_load_strategy="normal",
-                incognito=True,
-            )
+                driver_kwargs["binary_location"] = chrome_binary
+
+        try:
+            driver = Driver(**driver_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if browser == "safari" and "remote automation" in message.lower():
+                raise ScraperError(
+                    f"{SAFARI_REMOTE_AUTOMATION_HINT} Original error: {message}"
+                ) from exc
+            raise
 
         driver.set_page_load_timeout(20)
         driver.set_window_size(1400, 900)
@@ -533,11 +745,14 @@ class GoogleReviewsScraper:
             self._maps_session_ready = True
 
         driver.get(url)
+        _raise_if_rate_limited(driver)
         if self._wait_for_place_summary(driver):
             self.dismiss_cookies(driver)
             if self._is_limited_view(driver):
                 log.warning("Google Maps limited view detected")
             return True
+
+        _raise_if_rate_limited(driver)
 
         search_name = (place_name or "").strip() or self._place_name_from_url(url)
         if search_name:
@@ -552,6 +767,7 @@ class GoogleReviewsScraper:
 
             log.info("Direct URL slow; trying search navigation: %s", search_url)
             driver.get(search_url)
+            _raise_if_rate_limited(driver)
             if self._wait_for_place_summary(driver):
                 self.dismiss_cookies(driver)
                 return True
@@ -590,16 +806,7 @@ class GoogleReviewsScraper:
         if not self._wait_for_place_summary(driver, timeout=3):
             time.sleep(0.5)
 
-        try:
-            current_url = (driver.current_url or "").lower()
-            if (
-                "/sorry/" in current_url
-                or "recaptcha" in current_url
-                or "captcha" in current_url
-            ):
-                raise _RateLimited(f"rate-limit redirect: {current_url}")
-        except WebDriverException:
-            pass
+        _raise_if_rate_limited(driver)
 
         if self._is_permanently_closed(driver):
             return {
@@ -667,14 +874,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--headless",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run Chrome headless (default: true)",
+        default=SCRAPE_HEADLESS,
+        help=(
+            "Run the browser headless "
+            f"(default: SCRAPE_HEADLESS={SCRAPE_HEADLESS})"
+        ),
+    )
+    parser.add_argument(
+        "--browser",
+        default=SCRAPE_BROWSER,
+        choices=sorted(VALID_SCRAPE_BROWSERS),
+        help=(
+            "Browser for SeleniumBase Driver "
+            f"(default: SCRAPE_BROWSER={SCRAPE_BROWSER!r})"
+        ),
     )
     parser.add_argument(
         "--delay",
         type=float,
-        default=0.2,
-        help="Seconds between restaurant scrapes (default: 0.2)",
+        default=SCRAPE_DELAY_SECONDS,
+        help=(
+            "Seconds between restaurant scrapes "
+            f"(default: SCRAPE_DELAY_SECONDS={SCRAPE_DELAY_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--rate-limit-cooldown",
+        type=float,
+        default=RATE_LIMIT_COOLDOWN_SECONDS,
+        help=(
+            "Seconds to sleep and restart the browser after a Google rate-limit "
+            f"(default: RATE_LIMIT_COOLDOWN_SECONDS={RATE_LIMIT_COOLDOWN_SECONDS:g})"
+        ),
+    )
+    parser.add_argument(
+        "--rate-limit-retries",
+        type=int,
+        default=RATE_LIMIT_RETRIES,
+        help=(
+            "Retries per provider after rate-limit recovery "
+            f"(default: RATE_LIMIT_RETRIES={RATE_LIMIT_RETRIES})"
+        ),
     )
     parser.add_argument(
         "--limit-batches",
@@ -764,37 +1004,32 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
 
 
 def maps_url_from_record(record: dict) -> str | None:
-    results = record.get("results")
-    if not isinstance(results, dict):
+    result = record.get("result")
+    if not isinstance(result, dict):
         return None
-    uri = results.get("formatted_googleMapsUri") or results.get(
+    uri = result.get("formatted_googleMapsUri") or result.get(
         "formatted_google_maps_uri"
     )
     return str(uri).strip() if uri else None
 
 
 def has_scrapable_maps_result(record: dict) -> bool:
-    results = record.get("results")
-    if not isinstance(results, dict):
-        return False
-    cid = str(results.get("cid") or "").strip()
-    maps_uri = maps_url_from_record(record)
-    return bool(cid and maps_uri)
+    return bool(maps_url_from_record(record))
 
 
-def merge_summary_into_results(record: dict, summary: dict[str, Any]) -> None:
-    if not isinstance(record.get("results"), dict):
-        record["results"] = {}
-    record["results"]["rating"] = summary.get("rating")
-    record["results"]["total_reviews"] = summary.get("total_reviews")
-    record["results"]["is_gmaps_checked"] = True
+def merge_summary_into_result(record: dict, summary: dict[str, Any]) -> None:
+    if not isinstance(record.get("result"), dict):
+        record["result"] = {}
+    record["result"]["rating"] = summary.get("rating")
+    record["result"]["total_reviews"] = summary.get("total_reviews")
+    record["result"]["is_gmaps_checked"] = True
 
 
 def is_manual_rating_record(record: dict) -> bool:
-    results = record.get("results")
+    result = record.get("result")
     return (
-        isinstance(results, dict)
-        and str(results.get("rating_type") or "").strip().upper() == RATING_TYPE_MANUAL
+        isinstance(result, dict)
+        and str(result.get("rating_type") or "").strip().upper() == RATING_TYPE_MANUAL
     )
 
 
@@ -804,8 +1039,8 @@ def mark_record_permanently_closed(
     cache: GapiCache | None,
 ) -> None:
     record["is_permanently_closed"] = True
-    if isinstance(record.get("results"), dict):
-        record["results"]["is_gmaps_checked"] = True
+    if isinstance(record.get("result"), dict):
+        record["result"]["is_gmaps_checked"] = True
     if cache is not None:
         cache.mark_permanently_closed(record, marked_at=utc_now_iso())
 
@@ -841,7 +1076,7 @@ def process_provider(
         if summary.get("is_permanently_closed"):
             mark_record_permanently_closed(record, cache=cache)
             return record, None
-        merge_summary_into_results(record, summary)
+        merge_summary_into_result(record, summary)
         return record, None
     except (_DriverSessionLost, _RateLimited):
         raise
@@ -866,6 +1101,8 @@ def process_batch_file(
     output_dir: Path,
     error_dir: Path,
     delay: float,
+    rate_limit_cooldown: float,
+    rate_limit_retries: int,
     cache: GapiCache | None = None,
 ) -> dict[str, Any]:
     batch_started = utc_now_iso()
@@ -877,7 +1114,7 @@ def process_batch_file(
     providers = load_batch(batch_path)
     successes: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    missing_results_formatted_googleMapsUri_count = 0
+    missing_result_formatted_googleMapsUri_count = 0
 
     for index, provider in enumerate(providers):
         if not isinstance(provider, dict):
@@ -899,16 +1136,40 @@ def process_batch_file(
         )
         if not has_scrapable_maps_result(provider):
             successes.append(deepcopy(provider))
-            missing_results_formatted_googleMapsUri_count += 1
+            missing_result_formatted_googleMapsUri_count += 1
             continue
 
-        try:
-            success, error = process_provider(provider, scraper, cache=cache)
-        except _DriverSessionLost:
-            scraper.restart_driver()
-            success, error = process_provider(provider, scraper, cache=cache)
-        except _RateLimited as exc:
-            raise ScraperError(f"Rate limited: {exc}") from exc
+        success: dict[str, Any] | None = None
+        error: dict[str, Any] | None = None
+        attempt = 0
+
+        while True:
+            try:
+                success, error = process_provider(provider, scraper, cache=cache)
+                break
+            except _DriverSessionLost:
+                scraper.restart_driver()
+                try:
+                    success, error = process_provider(provider, scraper, cache=cache)
+                except _RateLimited as exc:
+                    if attempt >= rate_limit_retries:
+                        raise ScraperError(f"Rate limited: {exc}") from exc
+                    recover_from_rate_limit(
+                        scraper,
+                        cooldown_seconds=rate_limit_cooldown,
+                    )
+                    attempt += 1
+                    continue
+                break
+            except _RateLimited as exc:
+                if attempt >= rate_limit_retries:
+                    raise ScraperError(f"Rate limited: {exc}") from exc
+                recover_from_rate_limit(
+                    scraper,
+                    cooldown_seconds=rate_limit_cooldown,
+                )
+                attempt += 1
+                continue
 
         if success is not None:
             successes.append(success)
@@ -952,8 +1213,8 @@ def process_batch_file(
         "restaurant_count": len(providers),
         "success_count": success_count,
         "error_count": error_count,
-        "missing_results_formatted_googleMapsUri_count": (
-            missing_results_formatted_googleMapsUri_count
+        "missing_result_formatted_googleMapsUri_count": (
+            missing_result_formatted_googleMapsUri_count
         ),
     }
 
@@ -964,7 +1225,10 @@ def run_batches(
     output_dir: Path,
     error_dir: Path,
     headless: bool,
+    browser: str,
     delay: float,
+    rate_limit_cooldown: float,
+    rate_limit_retries: int,
     limit_batches: int | None = None,
 ) -> int:
     batch_files = list_batch_files(input_dir)
@@ -975,7 +1239,7 @@ def run_batches(
     run_start_perf = time.perf_counter()
     batch_results: list[dict[str, Any]] = []
     cache = GapiCache(GAPI_CACHE_DIR)
-    scraper = GoogleReviewsScraper(headless=headless)
+    scraper = GoogleReviewsScraper(headless=headless, browser=browser)
 
     try:
         scraper.start_driver()
@@ -990,6 +1254,8 @@ def run_batches(
                     output_dir=output_dir,
                     error_dir=error_dir,
                     delay=delay,
+                    rate_limit_cooldown=rate_limit_cooldown,
+                    rate_limit_retries=rate_limit_retries,
                     cache=cache,
                 )
             except (OSError, json.JSONDecodeError, ValueError, ScraperError) as exc:
@@ -1017,6 +1283,8 @@ def run_batches(
                         output_dir=output_dir,
                         error_dir=error_dir,
                         delay=delay,
+                        rate_limit_cooldown=rate_limit_cooldown,
+                        rate_limit_retries=rate_limit_retries,
                         cache=cache,
                     )
                 except Exception as retry_exc:  # noqa: BLE001
@@ -1054,8 +1322,8 @@ def run_batches(
 
     successful_batches = sum(1 for b in batch_results if b["status"] == "success")
     error_batches = len(batch_results) - successful_batches
-    missing_results_formatted_googleMapsUri_count = sum(
-        b.get("missing_results_formatted_googleMapsUri_count", 0) for b in batch_results
+    missing_result_formatted_googleMapsUri_count = sum(
+        b.get("missing_result_formatted_googleMapsUri_count", 0) for b in batch_results
     )
 
     run_record = {
@@ -1066,8 +1334,8 @@ def run_batches(
         "total_batches_count": len(batch_results),
         "successful_batches_count": successful_batches,
         "error_batches_count": error_batches,
-        "missing_results_formatted_googleMapsUri_count": (
-            missing_results_formatted_googleMapsUri_count
+        "missing_result_formatted_googleMapsUri_count": (
+            missing_result_formatted_googleMapsUri_count
         ),
         "batches": batch_results,
     }
@@ -1089,12 +1357,21 @@ def run_batches(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        browser = normalize_scrape_browser(args.browser)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     return run_batches(
         input_dir=args.input_dir.resolve(),
         output_dir=args.output_dir.resolve(),
         error_dir=args.error_dir.resolve(),
         headless=args.headless,
+        browser=browser,
         delay=args.delay,
+        rate_limit_cooldown=args.rate_limit_cooldown,
+        rate_limit_retries=args.rate_limit_retries,
         limit_batches=args.limit_batches,
     )
 

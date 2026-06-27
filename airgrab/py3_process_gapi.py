@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Pipeline step 3: process raw GAPI responses into ``results`` objects.
+"""Pipeline step 3: process raw GAPI responses into ``result`` objects.
 
 What it does:
   Reads ``p2_batched_gapi_details/``, matches GAPI places to each provider (distance,
-  place types), builds a ``results`` object (cid, maps URI, place_types, etc.), and
-  writes to ``p3_batched_processed_gapi_details/``. Updates ``gapi_cache`` with
-  processed results.
+  place types), builds a ``result`` object (cid, place_id, maps URI, place_types,
+  etc.), and writes to ``p3_batched_processed_gapi_details/``. Updates ``gapi_cache``
+  with processed results.
 
 Overall logic:
   - For each provider, check ``gapi_cache`` for protected entries first.
   - Otherwise require ``gapi_response`` on the record and run place-matching logic.
-  - Strip ``gapi_response`` from written output; persist ``results`` to cache.
+  - Strip ``gapi_response`` from written output; persist ``result`` to cache.
 
 Skip normal GAPI processing (copy cached ``result`` or pass through unchanged):
   - ``gapi_cache`` entry ``result.is_url_manually_verified`` == ``true`` → use cached
-    ``result`` as ``record.results``
+    ``result`` as ``record.result``
   - ``gapi_cache`` entry ``result.rating_type`` == ``"MANUAL"`` → use cached ``result``
   - ``gapi_cache`` entry top-level ``is_permanently_closed`` == ``true`` → set
     ``record.is_permanently_closed`` and return without processing
@@ -189,13 +189,13 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
     write_json(path, manifest)
 
 
-def _attach_result(record: dict[str, Any], results: dict[str, Any] | None) -> None:
-    if results is None:
+def _attach_result(record: dict[str, Any], result: dict[str, Any] | None) -> None:
+    if result is None:
         return
-    result = dict(results)
-    if result.get("is_url_manually_verified") is not True:
-        result["is_url_manually_verified"] = False
-    record["results"] = result
+    attached = dict(result)
+    if attached.get("is_url_manually_verified") is not True:
+        attached["is_url_manually_verified"] = False
+    record["result"] = attached
 
 
 def _strip_gapi_response(record: dict[str, Any]) -> dict[str, Any]:
@@ -297,15 +297,18 @@ def build_place_result(place: dict[str, Any]) -> dict[str, Any] | None:
     cid = extract_cid_from_google_maps_uri(google_maps_uri)
     if not cid:
         return None
+    place_id = str(place.get("id") or "").strip()
     result: dict[str, Any] = {
         "cid": cid,
         "formatted_google_maps_uri": CID_URI_TEMPLATE.format(cid=cid),
         "place_types": format_place_types(place),
     }
+    if place_id:
+        result["place_id"] = place_id
     return result
 
 
-def build_results_from_gapi_response(
+def build_result_from_gapi_response(
     provider: dict[str, Any],
     gapi_response: dict[str, Any],
     *,
@@ -347,13 +350,13 @@ def process_provider(
     if cached_entry and is_url_manually_verified_entry(cached_entry):
         cached_result = cached_entry.get("result")
         if isinstance(cached_result, dict):
-            record["results"] = deepcopy(cached_result)
+            record["result"] = deepcopy(cached_result)
             return record, None
 
     if cached_entry and is_manual_rating_entry(cached_entry):
         cached_result = cached_entry.get("result")
         if isinstance(cached_result, dict):
-            record["results"] = deepcopy(cached_result)
+            record["result"] = deepcopy(cached_result)
             return record, None
 
     if cached_entry and is_permanently_closed_entry(cached_entry):
@@ -386,8 +389,8 @@ def process_provider(
             )
         print(f"    crow_fly_distance_meters: {distance_meters}")
 
-        results = build_results_from_gapi_response(record, gapi_response)
-        _attach_result(record, results)
+        built = build_result_from_gapi_response(record, gapi_response)
+        _attach_result(record, built)
         return record, None
     except Exception as exc:  # noqa: BLE001
         record["process_error"] = ProcessGapiError(str(exc)).to_dict()
