@@ -41,6 +41,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from gapi_cache import GapiCache
+from run_manifest import append_run_to_manifest, load_manifest, save_manifest
 
 REPO_ROOT = SCRIPT_DIR.parent
 ENV_FILES = (REPO_ROOT / ".env", SCRIPT_DIR / ".env")
@@ -347,31 +348,6 @@ def relative_to_script(path: Path) -> str:
         return str(path.resolve())
 
 
-def _empty_manifest() -> dict[str, Any]:
-    return {"runs": []}
-
-
-def load_manifest(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return _empty_manifest()
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return _empty_manifest()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return _empty_manifest()
-    if not isinstance(data, dict):
-        return _empty_manifest()
-    if not isinstance(data.get("runs"), list):
-        data["runs"] = []
-    return data
-
-
-def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    write_json(path, manifest)
-
-
 def process_provider(
     provider: dict,
     *,
@@ -589,6 +565,9 @@ def main(argv: list[str] | None = None) -> int:
         "run_id": run_started,
         "started_at": run_started,
         "finished_at": utc_now_iso(),
+        "input_dir": str(batch_dir),
+        "output_dir": str(output_dir),
+        "error_dir": str(error_dir),
         "total_batches_count": len(batch_results),
         "successful_batches_count": successful_batches,
         "error_batches_count": error_batches,
@@ -599,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         manifest = load_manifest(MANIFEST_PATH)
-        manifest["runs"].append(run_record)
+        append_run_to_manifest(manifest, run_record)
         save_manifest(MANIFEST_PATH, manifest)
     except OSError as exc:
         print(f"Warning: could not update manifest: {exc}", file=sys.stderr)

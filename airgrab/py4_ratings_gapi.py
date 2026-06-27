@@ -56,6 +56,7 @@ from gapi_cache import (
     utc_now_iso,
 )
 from py2_gapi import GapiError, get_api_key
+from run_manifest import append_run_to_manifest, load_manifest, save_manifest
 
 PLACES_DETAILS_URL = "https://places.googleapis.com/v1/places/"
 DEFAULT_RATINGS_DETAILS_FIELD_MASK = (
@@ -207,31 +208,6 @@ def relative_to_script(path: Path) -> str:
         return str(path.resolve().relative_to(SCRIPT_DIR))
     except ValueError:
         return str(path.resolve())
-
-
-def _empty_manifest() -> dict[str, Any]:
-    return {"runs": []}
-
-
-def load_manifest(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return _empty_manifest()
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return _empty_manifest()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return _empty_manifest()
-    if not isinstance(data, dict):
-        return _empty_manifest()
-    if not isinstance(data.get("runs"), list):
-        data["runs"] = []
-    return data
-
-
-def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    write_json(path, manifest)
 
 
 def _to_float(value: Any) -> float | None:
@@ -489,6 +465,11 @@ def process_batch_file(
         if delay > 0 and index < len(providers) - 1 and outcome == "api_called":
             time.sleep(delay)
 
+    try:
+        cache.flush()
+    except OSError as exc:
+        print(f"  warning: could not flush gapi cache: {exc}", file=sys.stderr)
+
     output_path = output_dir / batch_path.name
     error_path = error_dir / batch_path.name
 
@@ -553,53 +534,47 @@ def main(argv: list[str] | None = None) -> int:
             f"Loaded {len(cache)} provider id(s) from {GAPI_CACHE_DIR.name}/index.json"
         )
 
-    try:
-        for batch_path in batch_files:
-            print(f"Processing {batch_path.name} ...")
-            try:
-                result = process_batch_file(
-                    batch_path,
-                    output_dir=output_dir,
-                    error_dir=error_dir,
-                    delay=args.delay,
-                    cache=cache,
-                )
-            except (OSError, json.JSONDecodeError, ValueError, GapiError) as exc:
-                result = {
-                    "batch_id": batch_id_from_path(batch_path),
-                    "input_file": relative_to_script(batch_path),
-                    "output_file": None,
-                    "error_file": None,
-                    "status": "error",
-                    "started_at": utc_now_iso(),
-                    "finished_at": utc_now_iso(),
-                    "restaurant_count": 0,
-                    "success_count": 0,
-                    "error_count": 0,
-                    "api_called_count": 0,
-                    "api_skipped_count": 0,
-                    "permanently_closed_count": 0,
-                    "temporarily_closed_count": 0,
-                    "missing_rating_reviews_count": 0,
-                    "batch_error": str(exc),
-                }
-                print(f"  batch failed: {exc}", file=sys.stderr)
-
-            batch_results.append(result)
-            print(
-                f"  {result['status']}: {result['success_count']} ok, "
-                f"{result['error_count']} error(s), "
-                f"api_called={result.get('api_called_count', 0)}, "
-                f"api_skipped={result.get('api_skipped_count', 0)}, "
-                f"permanently_closed={result.get('permanently_closed_count', 0)}, "
-                f"temporarily_closed={result.get('temporarily_closed_count', 0)}, "
-                f"missing_rating_reviews={result.get('missing_rating_reviews_count', 0)}"
-            )
-    finally:
+    for batch_path in batch_files:
+        print(f"Processing {batch_path.name} ...")
         try:
-            cache.flush()
-        except OSError as exc:
-            print(f"Warning: could not flush gapi cache: {exc}", file=sys.stderr)
+            result = process_batch_file(
+                batch_path,
+                output_dir=output_dir,
+                error_dir=error_dir,
+                delay=args.delay,
+                cache=cache,
+            )
+        except (OSError, json.JSONDecodeError, ValueError, GapiError) as exc:
+            result = {
+                "batch_id": batch_id_from_path(batch_path),
+                "input_file": relative_to_script(batch_path),
+                "output_file": None,
+                "error_file": None,
+                "status": "error",
+                "started_at": utc_now_iso(),
+                "finished_at": utc_now_iso(),
+                "restaurant_count": 0,
+                "success_count": 0,
+                "error_count": 0,
+                "api_called_count": 0,
+                "api_skipped_count": 0,
+                "permanently_closed_count": 0,
+                "temporarily_closed_count": 0,
+                "missing_rating_reviews_count": 0,
+                "batch_error": str(exc),
+            }
+            print(f"  batch failed: {exc}", file=sys.stderr)
+
+        batch_results.append(result)
+        print(
+            f"  {result['status']}: {result['success_count']} ok, "
+            f"{result['error_count']} error(s), "
+            f"api_called={result.get('api_called_count', 0)}, "
+            f"api_skipped={result.get('api_skipped_count', 0)}, "
+            f"permanently_closed={result.get('permanently_closed_count', 0)}, "
+            f"temporarily_closed={result.get('temporarily_closed_count', 0)}, "
+            f"missing_rating_reviews={result.get('missing_rating_reviews_count', 0)}"
+        )
 
     successful_batches = sum(1 for b in batch_results if b["status"] == "success")
     error_batches = len(batch_results) - successful_batches
@@ -635,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         manifest = load_manifest(MANIFEST_PATH)
-        manifest["runs"].append(run_record)
+        append_run_to_manifest(manifest, run_record)
         save_manifest(MANIFEST_PATH, manifest)
     except OSError as exc:
         print(f"Warning: could not update manifest: {exc}", file=sys.stderr)
